@@ -63,10 +63,26 @@ node server.js
 
 ### Systemd Service
 
+System-wide (requires sudo):
+
 ```bash
 sudo cp dgx-dashboard.service /etc/systemd/system/
 sudo systemctl enable --now dgx-dashboard
 ```
+
+User-level (no sudo, auto-starts at boot via lingering):
+
+```bash
+mkdir -p ~/.config/systemd/user
+sed '/^User=/d; s/WantedBy=multi-user.target/WantedBy=default.target/' \
+  dgx-dashboard.service > ~/.config/systemd/user/dgx-dashboard.service
+systemctl --user daemon-reload
+systemctl --user enable --now dgx-dashboard
+loginctl enable-linger $USER
+```
+
+Manage with `systemctl --user status|stop|restart dgx-dashboard`
+(or drop `--user` for the system-wide unit).
 
 ## Configuration
 
