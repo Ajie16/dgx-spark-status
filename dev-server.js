@@ -397,11 +397,11 @@ async function getTopProcesses(limit = 10) {
 async function getNvidiaGPUInfo() {
   try {
     const { stdout } = await execAsync(
-      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits'
+      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.draw.average,power.draw.instant,power.limit --format=csv,noheader,nounits'
     );
 
     const gpus = stdout.trim().split('\n').map(line => {
-      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerLimit] =
+      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerDrawAvg, powerDrawInstant, powerLimit] =
         line.split(',').map(s => s.trim());
 
       const parseValue = (val) => {
@@ -424,6 +424,8 @@ async function getNvidiaGPUInfo() {
         utilizationMemory: parseValue(utilMem),
         temperatureGpu: parseValue(temp),
         powerDraw: parseValue(powerDraw),
+        powerDrawAvg: parseValue(powerDrawAvg),
+        powerDrawInstant: parseValue(powerDrawInstant),
         powerLimit: parseValue(powerLimit),
         unifiedMemory: memTotal === '[N/A]' // Indicate unified memory
       };
@@ -436,10 +438,42 @@ async function getNvidiaGPUInfo() {
   }
 }
 
+// Get ComfyUI info by checking port 8188
+async function getComfyUIInfo() {
+  try {
+    const { stdout } = await execAsync(
+      `lsof -Pi :8188 -sTCP:LISTEN -t 2>/dev/null || ss -tlnp 2>/dev/null | grep ':8188' | grep -oP '(?<=pid=)\\d+' | head -1`
+    );
+    const pid = stdout.trim();
+    if (!pid) return { running: false, port: 8188 };
+
+    // Get process details
+    const { stdout: psOut } = await execAsync(
+      `ps -p ${pid} -o pid,user,%cpu,%mem,rss,command --no-headers 2>/dev/null`
+    );
+    const parts = psOut.trim().split(/\s+/);
+    const rss = parseInt(parts[4]) || 0;
+    const command = parts.slice(5).join(' ') || '';
+
+    return {
+      running: true,
+      port: 8188,
+      pid: parseInt(parts[0]) || parseInt(pid),
+      user: parts[1] || '',
+      cpu: parseFloat(parts[2]) || 0,
+      mem: parseFloat(parts[3]) || 0,
+      memoryGB: (rss / 1024 / 1024).toFixed(2),
+      command: command.length > 80 ? command.substring(0, 77) + '...' : command
+    };
+  } catch (error) {
+    return { running: false, port: 8188 };
+  }
+}
+
 // Collect system metrics
 async function getSystemMetrics() {
   try {
-    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats, cpuTemp] = await Promise.all([
+    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats, cpuTemp, comfyuiInfo] = await Promise.all([
       si.cpu(),
       si.mem(),
       si.currentLoad(),
@@ -453,7 +487,8 @@ async function getSystemMetrics() {
       si.fsSize(),
       si.time(),
       si.networkStats(),
-      si.cpuTemperature()
+      si.cpuTemperature(),
+      getComfyUIInfo()
     ]);
 
     const physical = networkStats.filter(n => n.iface !== 'lo' && !n.iface.startsWith('veth') && !n.iface.startsWith('br-'));
@@ -499,6 +534,7 @@ async function getSystemMetrics() {
         llama: llamaInfo,
         vllm: vllmInfo,
         ollama: ollamaInfo,
+        comfyui: comfyuiInfo,
         availableModels
       },
       disk: fsSize.map(disk => ({

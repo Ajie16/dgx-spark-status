@@ -29,16 +29,55 @@
 
   // History for sparklines (last 60 data points = 60 seconds)
   const HISTORY_LEN = 60;
+  const HISTORY_KEY = 'dgx-history';
   let cpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let gpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let netRxHistory = $state(Array(HISTORY_LEN).fill(0));
   let netTxHistory = $state(Array(HISTORY_LEN).fill(0));
+  let gpuPowerHistory = $state(Array(HISTORY_LEN).fill(0));
+  let gpuTempHistory = $state(Array(HISTORY_LEN).fill(0));
+  let cpuTempHistory = $state(Array(HISTORY_LEN).fill(0));
 
   function pushHistory(arr, val) {
     return [...arr.slice(1), val];
   }
 
+  function loadHistory() {
+    try {
+      const saved = localStorage.getItem(HISTORY_KEY);
+      if (saved) {
+        const data = JSON.parse(saved);
+        cpuHistory = data.cpu || Array(HISTORY_LEN).fill(0);
+        gpuHistory = data.gpu || Array(HISTORY_LEN).fill(0);
+        netRxHistory = data.netRx || Array(HISTORY_LEN).fill(0);
+        netTxHistory = data.netTx || Array(HISTORY_LEN).fill(0);
+        gpuPowerHistory = data.gpuPower || Array(HISTORY_LEN).fill(0);
+        gpuTempHistory = data.gpuTemp || Array(HISTORY_LEN).fill(0);
+        cpuTempHistory = data.cpuTemp || Array(HISTORY_LEN).fill(0);
+      }
+    } catch (e) {
+      console.error('Failed to load history:', e);
+    }
+  }
+
+  function saveHistory() {
+    try {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify({
+        cpu: cpuHistory,
+        gpu: gpuHistory,
+        netRx: netRxHistory,
+        netTx: netTxHistory,
+        gpuPower: gpuPowerHistory,
+        gpuTemp: gpuTempHistory,
+        cpuTemp: cpuTempHistory
+      }));
+    } catch (e) {
+      console.error('Failed to save history:', e);
+    }
+  }
+
   onMount(() => {
+    loadHistory();
     unsubscribe = subscribe((message) => {
       if (message.type === 'connected') {
         connected = true;
@@ -51,6 +90,10 @@
         const net = message.data.network?.find(n => n.iface === 'all') || message.data.network?.[0];
         netRxHistory = pushHistory(netRxHistory, net?.rx_sec_mb || 0);
         netTxHistory = pushHistory(netTxHistory, net?.tx_sec_mb || 0);
+        gpuPowerHistory = pushHistory(gpuPowerHistory, message.data.gpu?.[0]?.powerDraw || 0);
+        gpuTempHistory = pushHistory(gpuTempHistory, message.data.gpu?.[0]?.temperatureGpu || 0);
+        cpuTempHistory = pushHistory(cpuTempHistory, message.data.cpu?.temperature || 0);
+        saveHistory();
       }
     });
     metrics = getCurrentMetrics();
@@ -202,8 +245,6 @@
               <div class="stat-main">{gpu.model}</div>
               <div class="stat-sub">
                 {#if gpu.temperatureGpu !== null}{gpu.temperatureGpu}°C{/if}
-                {#if gpu.powerDraw !== null} · {gpu.powerDraw}W{/if}
-                {#if gpu.powerLimit !== null} / {gpu.powerLimit}W{/if}
               </div>
               {#if !gpu.unifiedMemory && gpu.memoryTotalGB !== null}
                 <div class="stat-sub mono">
@@ -318,7 +359,85 @@
       {/if}
     </div>
 
-    <!-- Row 2: Processes -->
+    <!-- Row 2: Power & Temperature Charts -->
+    {#if metrics.gpu && metrics.gpu.length > 0}
+      {@const gpu = metrics.gpu[0]}
+      <div class="charts-grid">
+        <!-- Power Chart -->
+        <div class="card chart-card">
+          <div class="section-header">
+            <h2>System Power</h2>
+            <div class="chart-value">
+              {#if gpu.powerDraw !== null}
+                <span class="chart-current">{gpu.powerDraw.toFixed(1)}</span>
+                <span class="chart-unit">W</span>
+              {/if}
+              {#if gpu.powerLimit !== null}
+                <span class="chart-limit">/ {gpu.powerLimit}W</span>
+              {/if}
+            </div>
+          </div>
+          <div class="chart-container">
+            <svg viewBox="0 0 400 120" preserveAspectRatio="none" class="chart-svg">
+              <!-- Grid lines -->
+              <line x1="0" y1="30" x2="400" y2="30" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+              <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+              <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+              <!-- Area -->
+              <path d={sparklineArea(gpuPowerHistory, 400, 120)} fill="rgba(255, 159, 10, 0.08)" />
+              <!-- Line -->
+              <path d={sparklinePath(gpuPowerHistory, 400, 120)} fill="none" stroke="#ff9f0a" stroke-width="2" />
+            </svg>
+          </div>
+          <div class="chart-labels">
+            <span>CPU + GPU + Memory</span>
+            {#if gpu.powerDrawAvg !== null}
+              <span>Avg {gpu.powerDrawAvg.toFixed(1)}W</span>
+            {/if}
+            {#if gpu.powerLimit !== null}
+              <span>{gpu.powerLimit}W</span>
+            {:else}
+              <span>Max</span>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Temperature Chart -->
+        <div class="card chart-card">
+          <div class="section-header">
+            <h2>Temperature</h2>
+            <div class="chart-value">
+              {#if gpu.temperatureGpu !== null}
+                <span class="chart-current gpu-temp">{gpu.temperatureGpu}°C</span>
+              {/if}
+              {#if metrics.cpu.temperature !== null}
+                <span class="chart-current cpu-temp">{metrics.cpu.temperature}°C</span>
+              {/if}
+            </div>
+          </div>
+          <div class="chart-container">
+            <svg viewBox="0 0 400 120" preserveAspectRatio="none" class="chart-svg">
+              <!-- Grid lines -->
+              <line x1="0" y1="30" x2="400" y2="30" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+              <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+              <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+              <!-- GPU temp area -->
+              <path d={sparklineArea(gpuTempHistory, 400, 120)} fill="rgba(255, 159, 10, 0.06)" />
+              <!-- GPU temp line -->
+              <path d={sparklinePath(gpuTempHistory, 400, 120)} fill="none" stroke="#ff9f0a" stroke-width="2" />
+              <!-- CPU temp line -->
+              <path d={sparklinePath(cpuTempHistory, 400, 120)} fill="none" stroke="#0a84ff" stroke-width="1.5" opacity="0.8" />
+            </svg>
+          </div>
+          <div class="chart-labels">
+            <span><span class="legend-dot gpu-temp-dot"></span>GPU</span>
+            <span><span class="legend-dot cpu-temp-dot"></span>CPU</span>
+          </div>
+        </div>
+      </div>
+    {/if}
+
+    <!-- Row 3: Processes -->
     {#if metrics.processes && metrics.processes.length > 0}
       <div class="card processes-card">
         <div class="section-header">
@@ -350,8 +469,6 @@
 
     <!-- Row 3: Inference Engines -->
     {#if metrics.inference}
-      {@const comfyuiProcesses = metrics.processes?.filter(p => p.command.toLowerCase().includes('comfyui')) || []}
-      {@const comfyuiRunning = comfyuiProcesses.length > 0}
       <div class="models-grid">
         <!-- llama.cpp -->
         <div class="card models-card">
@@ -508,27 +625,25 @@
         <div class="card models-card">
           <div class="section-header">
             <h2>ComfyUI</h2>
-            {#if comfyuiRunning}
-              <span class="engine-pill running">Running</span>
+            {#if metrics.inference.comfyui?.running}
+              <span class="engine-pill running">:{metrics.inference.comfyui.port}</span>
             {:else}
               <span class="engine-pill stopped">Stopped</span>
             {/if}
           </div>
           <div class="models-list">
-            {#if comfyuiRunning}
-              {#each comfyuiProcesses as process}
-                <div class="model-item loaded">
-                  <div class="model-header-row">
-                    <div class="model-name" title="{process.command}">{process.command.split(' ')[0].split('/').pop()}</div>
-                    <span class="running-badge">RUNNING</span>
-                  </div>
-                  <div class="model-info">
-                    <span class="model-size">{process.memoryGB} GB</span>
-                    <span class="model-params">CPU {process.cpu}%</span>
-                    <span class="model-params">PID {process.pid}</span>
-                  </div>
+            {#if metrics.inference.comfyui?.running}
+              <div class="model-item loaded">
+                <div class="model-header-row">
+                  <div class="model-name" title="{metrics.inference.comfyui.command}">{metrics.inference.comfyui.command.split(' ')[0].split('/').pop()}</div>
+                  <span class="running-badge">RUNNING</span>
                 </div>
-              {/each}
+                <div class="model-info">
+                  <span class="model-size">{metrics.inference.comfyui.memoryGB} GB</span>
+                  <span class="model-params">CPU {metrics.inference.comfyui.cpu}%</span>
+                  <span class="model-params">PID {metrics.inference.comfyui.pid}</span>
+                </div>
+              </div>
             {:else}
               <div class="model-empty">Not running</div>
             {/if}
@@ -1293,6 +1408,78 @@
   .note-btn.cancel:hover {
     background: var(--bg-subtle-hover);
   }
+
+  /* Charts */
+  .charts-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .chart-card {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+
+  .chart-value {
+    display: flex;
+    align-items: baseline;
+    gap: 0.5rem;
+  }
+
+  .chart-current {
+    font-size: 1.2rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+
+  .chart-current.gpu-temp { color: #ff9f0a; }
+  .chart-current.cpu-temp { color: #0a84ff; }
+
+  .chart-unit {
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+  }
+
+  .chart-limit {
+    font-size: 0.85rem;
+    color: var(--text-tertiary);
+  }
+
+  .chart-container {
+    width: 100%;
+    height: 120px;
+    margin-top: 0.5rem;
+  }
+
+  .chart-svg {
+    width: 100%;
+    height: 100%;
+  }
+
+  .chart-labels {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--text-tertiary);
+  }
+
+  .legend-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+    vertical-align: middle;
+    margin-right: 4px;
+  }
+
+  .legend-dot.gpu-temp-dot { background: #ff9f0a; }
+  .legend-dot.cpu-temp-dot { background: #0a84ff; }
 
   /* Footer */
   .footer {
