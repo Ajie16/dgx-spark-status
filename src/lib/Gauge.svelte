@@ -3,7 +3,7 @@
   export let max = 100;
   export let size = 120;
   export let thickness = 10;
-  export let color = '#76b900';
+  export let color = '#30d158';
   export let label = '';
   export let yellowThreshold = 70;
   export let redThreshold = 90;
@@ -41,7 +41,7 @@
       cy={center}
       r={radius}
       fill="none"
-      stroke="#2a2a2a"
+      stroke="var(--bg-subtle)"
       stroke-width={thickness}
     />
     <!-- Progress circle -->
@@ -64,8 +64,8 @@
       y1={yellowLine.y1}
       x2={yellowLine.x2}
       y2={yellowLine.y2}
-      stroke="#ffa726"
-      stroke-width="2"
+      stroke="rgba(255, 214, 10, 0.5)"
+      stroke-width="1.5"
       stroke-linecap="round"
     />
     <!-- Red threshold line -->
@@ -74,8 +74,8 @@
       y1={redLine.y1}
       x2={redLine.x2}
       y2={redLine.y2}
-      stroke="#ff6b6b"
-      stroke-width="2"
+      stroke="rgba(255, 69, 58, 0.5)"
+      stroke-width="1.5"
       stroke-linecap="round"
     />
   </svg>
@@ -91,7 +91,7 @@
   }
 
   .progress-circle {
-    transition: stroke-dashoffset 0.3s ease;
+    transition: stroke-dashoffset 0.4s cubic-bezier(0.25, 0.1, 0.25, 1);
   }
 
   .gauge-content {
@@ -104,8 +104,10 @@
 
   .gauge-value {
     font-size: 1.3rem;
-    font-weight: 700;
-    color: #fff;
+    font-weight: 600;
+    color: var(--text-primary);
     line-height: 1;
+    font-feature-settings: 'tnum';
+    letter-spacing: -0.02em;
   }
 </style>

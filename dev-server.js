@@ -439,7 +439,7 @@ async function getNvidiaGPUInfo() {
 // Collect system metrics
 async function getSystemMetrics() {
   try {
-    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats] = await Promise.all([
+    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats, cpuTemp] = await Promise.all([
       si.cpu(),
       si.mem(),
       si.currentLoad(),
@@ -452,7 +452,8 @@ async function getSystemMetrics() {
       getAvailableModels(),
       si.fsSize(),
       si.time(),
-      si.networkStats()
+      si.networkStats(),
+      si.cpuTemperature()
     ]);
 
     const physical = networkStats.filter(n => n.iface !== 'lo' && !n.iface.startsWith('veth') && !n.iface.startsWith('br-'));
@@ -476,6 +477,7 @@ async function getSystemMetrics() {
         physicalCores: cpu.physicalCores,
         speed: cpu.speed,
         usage: parseFloat(currentLoad.currentLoad.toFixed(2)),
+        temperature: cpuTemp.main !== null ? parseFloat(cpuTemp.main.toFixed(1)) : null,
         perCore: currentLoad.cpus.map(core => ({
           load: parseFloat(core.load.toFixed(2))
         }))
