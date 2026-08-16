@@ -52,6 +52,11 @@ coverage
 # Backup files
 *.bak-*
 model-notes.json
+metrics-history.json
+metrics-history.jsonl
+service-health.json
+system-events.json
+.clean-shutdown
 
 # Claude Code
 .claude

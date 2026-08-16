@@ -3,14 +3,18 @@ import si from 'systeminformation';
 import express from 'express';
 import { exec } from 'child_process';
 import { promisify } from 'util';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const execAsync = promisify(exec);
 const UPDATE_INTERVAL = 1000;
 const LLAMA_SERVER = 'http://127.0.0.1:8001';
 
 // Model notes — user-editable, stored in JSON file
-const NOTES_FILE = '/opt/dgx-spark-status/model-notes.json';
+const NOTES_FILE = join(__dirname, 'model-notes.json');
 
 function loadNotes() {
   try {
@@ -21,6 +25,391 @@ function loadNotes() {
 
 function saveNotes(notes) {
   writeFileSync(NOTES_FILE, JSON.stringify(notes, null, 2), 'utf8');
+}
+
+// ── Metrics history (7 days, append-only JSONL) ───────────────────────
+// 1-second samples kept in memory for 10 minutes (raw, not persisted),
+// then downsampled to 1-minute averages appended one line at a time to
+// metrics-history.jsonl (~150 KB/day of writes). File is trimmed to
+// AGG_MAX lines at startup and compacted periodically.
+const HISTORY_FILE = join(__dirname, 'metrics-history.jsonl');
+const RAW_MAX_AGE = 10 * 60 * 1000; // 10 min of 1s points
+const AGG_MAX = 7 * 24 * 60;        // 7 days of 1-min points
+
+let historyRaw = [];
+let historyAgg = [];
+let minuteBucket = null;
+let appendedSinceCompact = 0;
+
+function compactHistoryFile() {
+  try {
+    writeFileSync(HISTORY_FILE, historyAgg.map(p => JSON.stringify(p)).join('\n') + '\n');
+    appendedSinceCompact = 0;
+  } catch (e) {}
+}
+
+function loadHistoryFile() {
+  try {
+    // One-time migration from the previous whole-file JSON format
+    const oldFile = join(__dirname, 'metrics-history.json');
+    if (!existsSync(HISTORY_FILE) && existsSync(oldFile)) {
+      const old = JSON.parse(readFileSync(oldFile, 'utf8'));
+      historyAgg = Array.isArray(old.agg) ? old.agg.slice(-AGG_MAX) : [];
+      if (historyAgg.length) compactHistoryFile();
+      unlinkSync(oldFile);
+      return;
+    }
+    if (!existsSync(HISTORY_FILE)) return;
+    const lines = readFileSync(HISTORY_FILE, 'utf8').trim().split('\n').filter(Boolean);
+    const cutoff = Date.now() - AGG_MAX * 60000;
+    historyAgg = lines.map(l => { try { return JSON.parse(l); } catch { return null; } })
+      .filter(p => p && p.t >= cutoff)
+      .slice(-AGG_MAX);
+    if (lines.length > AGG_MAX + 1440) compactHistoryFile();
+  } catch (e) {}
+}
+
+function appendAggPoint(agg) {
+  try {
+    appendFileSync(HISTORY_FILE, JSON.stringify(agg) + '\n');
+    if (++appendedSinceCompact > 2880) compactHistoryFile(); // ~2 extra days
+  } catch (e) {}
+}
+
+const HISTORY_KEYS = ['cpu', 'gpu', 'gpuTemp', 'cpuTemp', 'gpuPower', 'mem'];
+
+function recordHistory(m) {
+  const point = {
+    t: m.timestamp,
+    cpu: m.cpu?.usage ?? 0,
+    gpu: m.gpu?.[0]?.utilizationGpu ?? 0,
+    gpuTemp: m.gpu?.[0]?.temperatureGpu ?? null,
+    cpuTemp: m.cpu?.temperature ?? null,
+    gpuPower: m.gpu?.[0]?.powerDraw ?? null,
+    mem: m.memory?.usagePercent ?? 0
+  };
+  historyRaw.push(point);
+  const cutoff = m.timestamp - RAW_MAX_AGE;
+  while (historyRaw.length && historyRaw[0].t < cutoff) historyRaw.shift();
+
+  const minute = Math.floor(m.timestamp / 60000);
+  if (!minuteBucket || minuteBucket.minute !== minute) {
+    if (minuteBucket && minuteBucket.n > 0) {
+      const agg = { t: minuteBucket.minute * 60000 };
+      for (const k of HISTORY_KEYS) {
+        agg[k] = minuteBucket.sums[k].n > 0
+          ? parseFloat((minuteBucket.sums[k].sum / minuteBucket.sums[k].n).toFixed(2))
+          : null;
+      }
+      historyAgg.push(agg);
+      if (historyAgg.length > AGG_MAX) historyAgg = historyAgg.slice(-AGG_MAX);
+      appendAggPoint(agg);
+    }
+    minuteBucket = { minute, n: 0, sums: Object.fromEntries(HISTORY_KEYS.map(k => [k, { sum: 0, n: 0 }])) };
+  }
+  minuteBucket.n++;
+  for (const k of HISTORY_KEYS) {
+    if (point[k] !== null && point[k] !== undefined) {
+      minuteBucket.sums[k].sum += point[k];
+      minuteBucket.sums[k].n++;
+    }
+  }
+}
+
+// ── Service availability tracking ─────────────────────────────────────
+// Tracks online/offline transitions of each inference engine. Persisted
+// every minute together with history.
+const HEALTH_FILE = join(__dirname, 'service-health.json');
+
+let serviceHealth = (() => {
+  try {
+    if (existsSync(HEALTH_FILE)) return JSON.parse(readFileSync(HEALTH_FILE, 'utf8'));
+  } catch (e) {}
+  return {};
+})();
+
+function updateServiceHealth(m) {
+  const now = m.timestamp;
+  const states = {
+    llama: !!m.inference?.llama?.available,
+    vllm: !!m.inference?.vllm?.available,
+    ollama: !!m.inference?.ollama?.available,
+    comfyui: !!m.inference?.comfyui?.running
+  };
+  for (const [key, online] of Object.entries(states)) {
+    const h = serviceHealth[key] || (serviceHealth[key] = { online: null, since: now, downCount: 0, lastDownAt: null });
+    if (h.online === null) {
+      h.online = online;
+      h.since = now;
+    } else if (h.online !== online) {
+      h.online = online;
+      h.since = now;
+      if (!online) {
+        h.downCount++;
+        h.lastDownAt = now;
+      }
+    }
+  }
+}
+
+// ── System events: boot / unclean shutdown / GPU throttling ──────────
+// A "clean shutdown" marker is written on SIGTERM/SIGINT. If the marker
+// is missing at startup but a previous run existed, the last session
+// ended uncleanly (crash, power loss, OOM kill).
+const EVENTS_FILE = join(__dirname, 'system-events.json');
+const SHUTDOWN_MARKER = join(__dirname, '.clean-shutdown');
+const EVENTS_MAX = 200;
+
+let systemEvents = (() => {
+  try {
+    if (existsSync(EVENTS_FILE)) return JSON.parse(readFileSync(EVENTS_FILE, 'utf8'));
+  } catch (e) {}
+  return [];
+})();
+
+// Events are appended to the in-memory list immediately, but the file is
+// flushed at most once per 30s (plus at shutdown). This keeps a flapping GPU
+// throttle state from rewriting system-events.json on every transition.
+let eventsDirty = false;
+
+function addEvent(type, detail = {}) {
+  systemEvents.push({ t: Date.now(), type, ...detail });
+  if (systemEvents.length > EVENTS_MAX) systemEvents = systemEvents.slice(-EVENTS_MAX);
+  eventsDirty = true;
+}
+
+function flushEvents() {
+  if (!eventsDirty) return;
+  try {
+    writeFileSync(EVENTS_FILE, JSON.stringify(systemEvents));
+    eventsDirty = false;
+  } catch (e) {}
+}
+
+function detectUncleanShutdown() {
+  const firstRun = !existsSync(EVENTS_FILE) && historyAgg.length === 0;
+  const wasClean = existsSync(SHUTDOWN_MARKER);
+  if (wasClean) { try { unlinkSync(SHUTDOWN_MARKER); } catch (e) {} }
+  if (!firstRun && !wasClean) {
+    const lastT = historyAgg.length ? historyAgg[historyAgg.length - 1].t : null;
+    addEvent('unclean_shutdown', { at: lastT });
+  }
+  addEvent('boot');
+}
+
+// GPU throttling episode tracking (transitions recorded as events).
+// A transition is only recorded after the throttle state has been stable for
+// THROTTLE_STABLE_MS, so brief on/off flapping near a temperature limit does
+// not generate event spam or disk writes.
+const THROTTLE_STABLE_MS = 5 * 1000;
+let throttlingSince = null;
+let throttleEpisode = null;
+let throttleCandidate = null;
+
+// GB10 toggles the SW Power Cap bit in bursts even at idle. Warnings are held
+// briefly; informational bits are latched for 5 minutes so the card doesn't
+// flash when the driver starts/stops toggling the bit.
+const THROTTLE_WARNING_HOLD_MS = 10 * 1000;
+const THROTTLE_INFO_HOLD_MS = 5 * 60 * 1000;
+let heldThrottleWarnings = [];
+let heldThrottleInfo = [];
+let warningHoldUntil = 0;
+let infoHoldUntil = 0;
+
+function trackThrottling(m) {
+  const gpu = m.gpu?.[0];
+  const tr = gpu?.throttleReasons;
+  const active = !!tr?.throttling;
+  const now = m.timestamp;
+
+  if (!throttleCandidate || throttleCandidate.active !== active) {
+    throttleCandidate = {
+      active,
+      since: now,
+      reasons: tr?.active || [],
+      peakTemp: gpu?.temperatureGpu ?? null
+    };
+  } else if (active && gpu?.temperatureGpu != null) {
+    throttleCandidate.peakTemp = Math.max(throttleCandidate.peakTemp ?? 0, gpu.temperatureGpu);
+  }
+
+  if (now - throttleCandidate.since >= THROTTLE_STABLE_MS) {
+    if (throttleCandidate.active && !throttlingSince) {
+      throttlingSince = throttleCandidate.since;
+      throttleEpisode = { reasons: throttleCandidate.reasons, peakTemp: throttleCandidate.peakTemp };
+      addEvent('throttle_start', { reasons: throttleCandidate.reasons, temp: throttleCandidate.peakTemp });
+    } else if (!throttleCandidate.active && throttlingSince) {
+      addEvent('throttle_end', {
+        durationMs: now - throttlingSince,
+        reasons: throttleEpisode?.reasons || [],
+        peakTemp: throttleEpisode?.peakTemp ?? null
+      });
+      throttlingSince = null;
+      throttleEpisode = null;
+    }
+    throttleCandidate = null;
+  }
+
+  if (throttlingSince && active && gpu?.temperatureGpu != null) {
+    throttleEpisode.peakTemp = Math.max(throttleEpisode.peakTemp ?? 0, gpu.temperatureGpu);
+  }
+}
+
+function stabilizeThrottleDisplay(m) {
+  const tr = m.gpu?.[0]?.throttleReasons;
+  if (!tr) return;
+  const warnings = tr.warnings || [];
+  const info = (tr.active || []).filter(r => !warnings.includes(r));
+  const now = Date.now();
+  if (warnings.length) {
+    heldThrottleWarnings = warnings;
+    warningHoldUntil = now + THROTTLE_WARNING_HOLD_MS;
+  } else if (now > warningHoldUntil) {
+    heldThrottleWarnings = [];
+  }
+  if (info.length) {
+    heldThrottleInfo = info;
+    infoHoldUntil = now + THROTTLE_INFO_HOLD_MS;
+  } else if (now > infoHoldUntil) {
+    heldThrottleInfo = [];
+  }
+  tr.warnings = heldThrottleWarnings;
+  tr.info = heldThrottleInfo;
+}
+
+let lastHealthJson = JSON.stringify(serviceHealth);
+
+function persistState() {
+  flushEvents();
+  const json = JSON.stringify(serviceHealth);
+  if (json === lastHealthJson) return;
+  try {
+    writeFileSync(HEALTH_FILE, json);
+    lastHealthJson = json;
+  } catch (e) {}
+}
+
+function gracefulShutdown() {
+  persistState();
+  try { writeFileSync(SHUTDOWN_MARKER, String(Date.now())); } catch (e) {}
+  process.exit(0);
+}
+
+// Model inventory scan (du -sb over large model dirs) is far too slow to run
+// inside the 1s sampling loop. Refresh it in the background and reuse the
+// cached result across ticks; the UI picks new models up on the next refresh.
+const MODEL_REFRESH_MS = 10 * 60 * 1000;
+let modelInventory = { llama: [], vllm: [] };
+let modelScanBusy = false;
+let modelLastScan = 0;
+
+async function refreshModelInventory() {
+  if (modelScanBusy) return;
+  modelScanBusy = true;
+  try {
+    modelInventory = await getAvailableModels();
+    modelLastScan = Date.now();
+  } catch (e) {
+    console.error('Error scanning model inventory:', e.message);
+  } finally {
+    modelScanBusy = false;
+  }
+}
+
+loadHistoryFile();
+detectUncleanShutdown();
+refreshModelInventory();
+setInterval(flushEvents, 30 * 1000);
+setInterval(persistState, 5 * 60 * 1000);
+process.on('SIGTERM', gracefulShutdown);
+process.on('SIGINT', gracefulShutdown);
+
+// ── Disk I/O rates + NVMe temperature ─────────────────────────────────
+// /proc/diskstats and /sys/class/hwmon are world-readable; SMART needs
+// root, so temperature is used as the disk health indicator instead.
+let prevDiskStats = null;
+let prevDiskTime = 0;
+
+function getDiskIO() {
+  try {
+    const now = Date.now();
+    const lines = readFileSync('/proc/diskstats', 'utf8').trim().split('\n');
+    let rSectors = 0, wSectors = 0;
+    for (const line of lines) {
+      const p = line.trim().split(/\s+/);
+      // Whole-disk devices only (skip partitions like nvme0n1p1 / sda1)
+      if (!/^(nvme\d+n\d+|sd[a-z]+|vd[a-z]+|mmcblk\d+)$/.test(p[2])) continue;
+      rSectors += parseInt(p[5]);
+      wSectors += parseInt(p[9]);
+    }
+    let readMBs = null, writeMBs = null;
+    if (prevDiskStats && now > prevDiskTime) {
+      const dt = (now - prevDiskTime) / 1000;
+      readMBs = Math.max(0, ((rSectors - prevDiskStats.r) * 512 / (1024 ** 2)) / dt);
+      writeMBs = Math.max(0, ((wSectors - prevDiskStats.w) * 512 / (1024 ** 2)) / dt);
+    }
+    prevDiskStats = { r: rSectors, w: wSectors };
+    prevDiskTime = now;
+    return {
+      readMBs: readMBs !== null ? parseFloat(readMBs.toFixed(2)) : null,
+      writeMBs: writeMBs !== null ? parseFloat(writeMBs.toFixed(2)) : null,
+      temp: getDiskTemp()
+    };
+  } catch (e) {
+    return { readMBs: null, writeMBs: null, temp: getDiskTemp() };
+  }
+}
+
+function getDiskTemp() {
+  try {
+    for (const d of readdirSync('/sys/class/hwmon')) {
+      if (readFileSync(`/sys/class/hwmon/${d}/name`, 'utf8').trim() === 'nvme') {
+        return parseFloat((parseInt(readFileSync(`/sys/class/hwmon/${d}/temp1_input`, 'utf8').trim()) / 1000).toFixed(1));
+      }
+    }
+  } catch (e) {}
+  return null;
+}
+
+// GPU clock throttle/event reasons (bitmask from nvidia-smi)
+const THROTTLE_REASONS = [
+  [0x1n,   'GPU Idle', false],
+  [0x2n,   'App Clocks Setting', false],
+  [0x4n,   'SW Power Cap', false],  // stays set at idle on GB10 — informational
+  [0x8n,   'HW Slowdown', true],
+  [0x10n,  'Sync Boost', false],
+  [0x20n,  'SW Thermal Slowdown', true],
+  [0x40n,  'HW Thermal Slowdown', true],
+  [0x80n,  'HW Power Brake', true],
+  [0x100n, 'Display Clock Setting', false]
+];
+
+function parseThrottleReasons(hex) {
+  try {
+    const mask = BigInt(hex);
+    const active = [];
+    const warnings = [];
+    for (const [bit, name, isWarning] of THROTTLE_REASONS) {
+      if (mask & bit) {
+        active.push(name);
+        if (isWarning) warnings.push(name);
+      }
+    }
+    return { raw: hex, active, warnings, throttling: warnings.length > 0 };
+  } catch (e) {
+    return { raw: String(hex), active: [], warnings: [], throttling: false };
+  }
+}
+
+// The service applies an upper GPU clock cap at start via
+// `nvidia-smi -lgc <min>,<max>` (see dgx-spark-status.service). nvidia-smi
+// cannot query the applied lock, so the unit exports the range as
+// GPU_CLOCK_LOCK and the dashboard surfaces the max as the displayed cap.
+function clockLimitFromEnv() {
+  const spec = process.env.GPU_CLOCK_LOCK || '';
+  const parts = spec.split(',').map(s => parseFloat(s.trim()));
+  const max = Math.max(...parts.filter(Number.isFinite));
+  return Number.isFinite(max) && max > 0 ? max : null;
 }
 
 function parseModelMeta(modelId) {
@@ -251,20 +640,25 @@ async function getVllmInfo() {
       'http://127.0.0.1:8102/v1/models',
       'http://127.0.0.1:8109/v1/models'
     ];
-    for (const endpoint of modelEndpoints) {
-      try {
-        const { stdout: modelsOut } = await execAsync(`curl -s --max-time 2 ${endpoint} 2>/dev/null || true`);
-        if (!modelsOut) continue;
-        if (/Loading model/i.test(modelsOut)) {
-          loading = true;
-          continue;
-        }
-        const data = JSON.parse(modelsOut);
-        modelAlias = data?.data?.[0]?.id || modelAlias;
-        if (modelAlias) break;
-      } catch (e) {
-        if (/Loading model/i.test(String(e?.message || ''))) loading = true;
+    // Probe all candidate ports in parallel: three serial 2s curls would add
+    // up to 6s to every sample when vLLM is down.
+    const endpointResults = await Promise.allSettled(
+      modelEndpoints.map(async (endpoint) => {
+        const { stdout } = await execAsync(`curl -s --max-time 2 ${endpoint} 2>/dev/null || true`);
+        return stdout.trim();
+      })
+    );
+    for (const result of endpointResults) {
+      const modelsOut = result.status === 'fulfilled' ? result.value : '';
+      if (!modelsOut) continue;
+      if (/Loading model/i.test(modelsOut)) {
+        loading = true;
+        continue;
       }
+      try {
+        const data = JSON.parse(modelsOut);
+        if (data?.data?.[0]?.id) modelAlias = data.data[0].id;
+      } catch (e) {}
     }
 
     // Parse served alias + actual model path from docker command line.
@@ -397,11 +791,11 @@ async function getTopProcesses(limit = 10) {
 async function getNvidiaGPUInfo() {
   try {
     const { stdout } = await execAsync(
-      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.draw.average,power.draw.instant,power.limit --format=csv,noheader,nounits'
+      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.draw.average,power.draw.instant,power.limit,clocks.current.graphics,clocks.current.sm,clocks_event_reasons.active --format=csv,noheader,nounits'
     );
 
     const gpus = stdout.trim().split('\n').map(line => {
-      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerDrawAvg, powerDrawInstant, powerLimit] =
+      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerDrawAvg, powerDrawInstant, powerLimit, clocksGraphics, clocksSm, throttleRaw] =
         line.split(',').map(s => s.trim());
 
       const parseValue = (val) => {
@@ -427,6 +821,10 @@ async function getNvidiaGPUInfo() {
         powerDrawAvg: parseValue(powerDrawAvg),
         powerDrawInstant: parseValue(powerDrawInstant),
         powerLimit: parseValue(powerLimit),
+        clocksGraphics: parseValue(clocksGraphics),
+        clocksSm: parseValue(clocksSm),
+        clockLimitMax: clockLimitFromEnv(),
+        throttleReasons: parseThrottleReasons(throttleRaw),
         unifiedMemory: memTotal === '[N/A]' // Indicate unified memory
       };
     });
@@ -473,7 +871,7 @@ async function getComfyUIInfo() {
 // Collect system metrics
 async function getSystemMetrics() {
   try {
-    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats, cpuTemp, comfyuiInfo] = await Promise.all([
+    const [cpu, mem, currentLoad, osInfo, gpuData, processes, llamaInfo, vllmInfo, ollamaInfo, availableModels, fsSize, time, networkStats, cpuTemp, comfyuiInfo, diskIO] = await Promise.all([
       si.cpu(),
       si.mem(),
       si.currentLoad(),
@@ -483,12 +881,13 @@ async function getSystemMetrics() {
       getLlamaInfo(),
       getVllmInfo(),
       getOllamaInfo(),
-      getAvailableModels(),
+      modelInventory,
       si.fsSize(),
       si.time(),
       si.networkStats(),
       si.cpuTemperature(),
-      getComfyUIInfo()
+      getComfyUIInfo(),
+      Promise.resolve(getDiskIO())
     ]);
 
     const physical = networkStats.filter(n => n.iface !== 'lo' && !n.iface.startsWith('veth') && !n.iface.startsWith('br-'));
@@ -549,6 +948,7 @@ async function getSystemMetrics() {
         usedGB: parseFloat((disk.used / (1024 ** 3)).toFixed(2)),
         availableGB: parseFloat((disk.available / (1024 ** 3)).toFixed(2))
       })),
+      diskIO,
       uptime: {
         seconds: time.uptime,
         days: Math.floor(time.uptime / 86400),
@@ -600,14 +1000,24 @@ function handleSSE(req, res) {
   // Send initial comment to establish connection
   res.write(':ok\n\n');
 
-  // Send initial metrics immediately
-  getSystemMetrics().then(metrics => {
-    if (metrics) {
-      res.write(`data: ${JSON.stringify(metrics)}\n\n`);
-    }
-  }).catch(error => {
-    console.error('Error getting initial metrics:', error);
-  });
+  // Send initial metrics immediately (reuse latest sample if available)
+  if (latestMetrics) {
+    res.write(`data: ${JSON.stringify(latestMetrics)}\n\n`);
+  } else {
+    // Wait for the in-flight boot sample instead of kicking off a second
+    // full collection that would contend with the first one.
+    (tickPromise || tick()).then(() => {
+      if (latestMetrics && !res.writableEnded) {
+        try {
+          res.write(`data: ${JSON.stringify(latestMetrics)}\n\n`);
+        } catch (error) {
+          console.error('Error sending initial metrics:', error.message);
+        }
+      }
+    }).catch(error => {
+      console.error('Error getting initial metrics:', error);
+    });
+  }
 
   // Add client to set
   const client = { res, ip: clientIp };
@@ -625,33 +1035,55 @@ function handleSSE(req, res) {
   });
 }
 
-// Broadcast metrics to all connected clients
-async function broadcastMetrics() {
-  if (sseClients.size === 0) return;
+// Always-on sampling loop: collects metrics every second regardless of
+// connected clients (needed for 24h history and service health tracking),
+// and broadcasts to SSE clients when any are connected. Slow samples are
+// never overlapped: a new tick is skipped while the previous one is running.
+let latestMetrics = null;
+let tickPromise = null;
 
-  try {
-    const metrics = await getSystemMetrics();
-    if (!metrics) return;
-    metrics.modelNotes = loadNotes();
+async function tick() {
+  if (tickPromise) return tickPromise;
+  tickPromise = (async () => {
+    try {
+      if (Date.now() - modelLastScan > MODEL_REFRESH_MS) refreshModelInventory();
+      const metrics = await getSystemMetrics();
+      if (!metrics) return;
+      recordHistory(metrics);
+      updateServiceHealth(metrics);
+      trackThrottling(metrics);
+      stabilizeThrottleDisplay(metrics);
+      if (metrics.inference) metrics.inference.health = serviceHealth;
+      metrics.events = systemEvents.slice(-20);
+      metrics.modelNotes = loadNotes();
+      latestMetrics = metrics;
 
-    const data = `data: ${JSON.stringify(metrics)}\n\n`;
+      if (sseClients.size === 0) return;
+      const data = `data: ${JSON.stringify(metrics)}\n\n`;
 
-    // Send to all connected clients
-    for (const client of sseClients) {
-      try {
-        client.res.write(data);
-      } catch (error) {
-        console.error(`Error sending to ${client.ip}:`, error.message);
-        sseClients.delete(client);
+      // Send to all connected clients
+      for (const client of sseClients) {
+        try {
+          client.res.write(data);
+        } catch (error) {
+          console.error(`Error sending to ${client.ip}:`, error.message);
+          sseClients.delete(client);
+        }
       }
+    } catch (error) {
+      console.error('Error in metrics tick:', error);
     }
-  } catch (error) {
-    console.error('Error broadcasting metrics:', error);
+  })();
+  try {
+    await tickPromise;
+  } finally {
+    tickPromise = null;
   }
 }
 
-// Start broadcasting interval
-setInterval(broadcastMetrics, UPDATE_INTERVAL);
+// Start sampling interval
+setInterval(tick, UPDATE_INTERVAL);
+tick();
 
 async function startDevServer() {
   // Create Vite dev server with middleware mode
@@ -669,6 +1101,16 @@ async function startDevServer() {
 
   // Add SSE endpoint BEFORE Vite middleware
   app.get('/api/metrics', handleSSE);
+
+  // Metrics history window (1-min aggregates + last 10 min of 1s samples).
+  // Defaults to 24h — the largest chart range the UI can select — but any
+  // window up to the 7-day retention cap can be requested with ?hours=N.
+  app.get('/api/history', (req, res) => {
+    const hours = Math.min(7 * 24, Math.max(1, parseInt(req.query.hours, 10) || 24));
+    const cutoff = Date.now() - hours * 60 * 60 * 1000;
+    const agg = historyAgg.filter(p => p.t >= cutoff);
+    res.json({ agg, raw: historyRaw });
+  });
 
   // Model notes API
   app.use(express.json());

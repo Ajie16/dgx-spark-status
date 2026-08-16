@@ -194,15 +194,23 @@ async function getTopProcesses(limit = 10) {
   }
 }
 
+// Upper GPU clock cap applied at service start (GPU_CLOCK_LOCK=min,max).
+function clockLimitFromEnv() {
+  const spec = process.env.GPU_CLOCK_LOCK || '';
+  const parts = spec.split(',').map(s => parseFloat(s.trim()));
+  const max = Math.max(...parts.filter(Number.isFinite));
+  return Number.isFinite(max) && max > 0 ? max : null;
+}
+
 // Get NVIDIA GPU info using nvidia-smi
 async function getNvidiaGPUInfo() {
   try {
     const { stdout } = await execAsync(
-      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit --format=csv,noheader,nounits'
+      'nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,utilization.gpu,utilization.memory,temperature.gpu,power.draw,power.limit,clocks.current.graphics,clocks.current.sm --format=csv,noheader,nounits'
     );
 
     const gpus = stdout.trim().split('\n').map(line => {
-      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerLimit] =
+      const [index, name, memTotal, memUsed, memFree, utilGpu, utilMem, temp, powerDraw, powerLimit, clocksGraphics, clocksSm] =
         line.split(',').map(s => s.trim());
 
       const parseValue = (val) => {
@@ -226,6 +234,9 @@ async function getNvidiaGPUInfo() {
         temperatureGpu: parseValue(temp),
         powerDraw: parseValue(powerDraw),
         powerLimit: parseValue(powerLimit),
+        clocksGraphics: parseValue(clocksGraphics),
+        clocksSm: parseValue(clocksSm),
+        clockLimitMax: clockLimitFromEnv(),
         unifiedMemory: memTotal === '[N/A]'
       };
     });

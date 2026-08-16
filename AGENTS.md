@@ -35,7 +35,7 @@ Dev dependencies: SvelteKit/Vite/Svelte toolchain.
 | `vite.config.js` | SvelteKit Vite plugin; dev server `host: '0.0.0.0'`, `port: 9000`, `strictPort: true`; HMR overlay disabled; `optimizeDeps.exclude: ['systeminformation']`. |
 | `svelte.config.js` | Uses `@sveltejs/adapter-node` and `vitePreprocess()`. |
 | `jsconfig.json` | Extends `./.svelte-kit/tsconfig.json`, `checkJs: true`, `strict: false`. |
-| `.gitignore` | Excludes `node_modules`, `build`, `.svelte-kit`, `.output`, `.env`, `model-notes.json`, `.claude`, editor files. |
+| `.gitignore` | Excludes `node_modules`, `build`, `.svelte-kit`, `.output`, `.env`, state files (`model-notes.json`, `metrics-history.json*`, `service-health.json`, `system-events.json`, `.clean-shutdown`), `.claude`, editor files. |
 | `.vscode/extensions.json` | Recommends `svelte.svelte-vscode`. |
 
 ## Code Organization
@@ -112,10 +112,14 @@ node server.js
 
 1. `dev-server.js` creates an Express app.
 2. It registers `/api/metrics` with its own SSE handler.
-3. It registers `/api/notes` (GET/POST) backed by `/opt/dgx-spark-status/model-notes.json`.
-4. It mounts the Vite dev middleware (`middlewareMode: true`) so SvelteKit page routes and HMR work.
-5. SvelteKit routes such as `/api/ollama` are also reachable through Vite middleware, but `/api/metrics` is intercepted first by Express.
-6. `setInterval(broadcastMetrics, 1000)` pushes SSE data to connected clients.
+3. It registers `/api/notes` (GET/POST) backed by `model-notes.json` in the project root (gitignored).
+4. It registers `/api/history` (GET) returning up to 24h of metrics history by default; `?hours=N` (1–168) requests a different window.
+5. It mounts the Vite dev middleware (`middlewareMode: true`) so SvelteKit page routes and HMR work.
+6. SvelteKit routes such as `/api/ollama` are also reachable through Vite middleware, but `/api/metrics` is intercepted first by Express.
+7. An always-on sampling loop (`tick`, 1s interval) collects metrics **regardless of connected clients**: it records 7-day history (1s samples kept 10 min in memory, then 1-min aggregates appended to `metrics-history.jsonl` — append-only, ~150 KB/day of writes), tracks inference-engine availability (up/down transitions, outage counts, persisted to `service-health.json` every 5 min), and broadcasts to SSE clients when any are connected. Ticks never overlap (a new tick is skipped while the previous one runs), the expensive model-inventory scan (`du -sb` over large model dirs) is cached and refreshed in the background every 10 min instead of blocking each sample, vLLM model endpoints are probed in parallel, and the first SSE message for a client waits on the in-flight boot sample rather than triggering a duplicate collection.
+8. **System events** (`system-events.json`, last 200): `boot` on every service start, `unclean_shutdown` when the clean-shutdown marker (`.clean-shutdown`, written on SIGTERM/SIGINT) is missing at startup (i.e. crash / power loss / OOM kill), and `throttle_start`/`throttle_end` on GPU throttling transitions. Throttle transitions are only recorded after 5s of stable state (anti-flap), and the events file is flushed at most once per 30s (plus on shutdown) rather than on every event. The last 20 events are included in the SSE payload (`metrics.events`) and shown in the Events card.
+9. GPU metrics include current clocks (`clocks.current.graphics` / `clocks.current.sm`), the configured boost cap (`clockLimitMax`, from the `GPU_CLOCK_LOCK` env var set by the systemd unit — nvidia-smi cannot query the applied `-lgc` lock, so the dashboard trusts the unit's value), and clock throttle/event reasons (`clocks_event_reasons.active` bitmask decoded into `gpu[].throttleReasons` with `warnings` vs `active`). `SW Power Cap` is treated as informational on GB10 (the bit flips in bursts even at idle), so only thermal slowdown / HW power brake / HW slowdown render as red `⚠` warnings; other bits render as muted text. Displayed indicators are stabilized: warnings held 10s, info bits latched 5 min, so the card doesn't flash between samples. Disk I/O rates come from `/proc/diskstats` deltas and NVMe temperature from `/sys/class/hwmon` (`metrics.diskIO`); SMART is not used because `smartctl` requires root.
+10. The power/temperature charts position points by their **real timestamps** on the x-axis (1s live samples and 1-min aggregates mix without distorting the axis; null values break the line). A segmented 1h/6h/24h control below the charts switches the window (defaults to 1h); the client keeps 24h of 1-min server aggregates plus 10 min of live 1s samples and re-fetches `/api/history?hours=24` every minute.
 
 ### Production (`npm run build` then `node server.js`)
 
@@ -130,7 +134,8 @@ node server.js
 |----------|-----|------|-------------|
 | `GET /api/metrics` | ✅ (rich, includes Ollama + notes) | ✅ (basic, no Ollama/notes) | SSE stream of system metrics (1s interval) |
 | `POST /api/ollama` | ✅ | ✅ | `action`: `pull`, `delete`, `load`, `unload`; `model`: model name |
-| `GET/POST /api/notes` | ✅ | ❌ | Per-model notes stored in `/opt/dgx-spark-status/model-notes.json` |
+| `GET/POST /api/notes` | ✅ | ❌ | Per-model notes stored in `model-notes.json` (project root) |
+| `GET /api/history` | ✅ | ❌ | Metrics history: `{ agg, raw }` — 1-min aggregates for `?hours=N` (default 24, max 168) + 1s samples (last 10 min) |
 
 ## Code Style & Conventions
 
@@ -164,7 +169,7 @@ node server.js
 
 ## Deployment
 
-The README documents a systemd service path `dgx-dashboard.service`, but no service file is currently present in the repository. The `start.sh` script is the provided convenience launcher.
+The repository ships a systemd unit named `dgx-spark-status.service` that runs `node dev-server.js` (port 9000) as user `xujie`. It is deliberately **not** named `dgx-dashboard.service`: that unit name is already taken on DGX Spark hosts by NVIDIA's preinstalled "DGX Dashboard Service" (port 11000). `start.sh` (tmux + `npm run dev`) remains an equivalent launcher. Only one instance may run at a time — dev-server binds port 9000 with `strictPort: true`, so a second instance crash-loops.
 
 Typical deployment steps:
 
@@ -174,7 +179,13 @@ npm run build
 node server.js
 ```
 
-For a persistent service, create a systemd unit that runs `node server.js` from the project directory and bind it to port 9000.
+For a persistent service, install the bundled unit:
+
+```bash
+sudo cp dgx-spark-status.service /etc/systemd/system/dgx-spark-status.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now dgx-spark-status
+```
 
 ## Security Considerations
 
@@ -186,13 +197,13 @@ For a persistent service, create a systemd unit that runs `node server.js` from 
   Avoid exposing the service to untrusted networks.
 - **No HTTPS/TLS** in the provided server scripts.
 - **CORS wildcard** — the SSE endpoint sets `Access-Control-Allow-Origin: *`.
-- **Model notes file** — `dev-server.js` reads/writes `/opt/dgx-spark-status/model-notes.json` directly. Ensure the directory exists and file permissions are appropriate.
+- **State files in project root** — `dev-server.js` reads/writes `model-notes.json`, `metrics-history.jsonl`, `service-health.json`, `system-events.json`, and `.clean-shutdown` next to itself (all gitignored). They contain system metrics, event history, and service uptime data; review before sharing the directory.
 - **Input validation is minimal** — the Ollama endpoint checks only the `action` value; the `model` value is passed through to shell or HTTP bodies with limited sanitization.
 
 ## Known Issues & Gotchas
 
 1. **Production `/api/metrics` is incomplete vs. dev**
-   The SvelteKit route `src/routes/api/metrics/+server.js` does not collect Ollama data and does not include `modelNotes`. The UI (`SystemMetrics.svelte`) reads `metrics.modelNotes` and `metrics.inference.ollama`, so those features silently fail in production.
+   The SvelteKit route `src/routes/api/metrics/+server.js` does not collect Ollama data, `modelNotes`, `diskIO`, throttle reasons, or service health, and there is no production `/api/history`. The UI (`SystemMetrics.svelte`) reads all of these, so those features silently fail in production.
 
 2. **Production SSE crash on client disconnect**
    When a client disconnects from the production `/api/metrics` stream, the interval continues to call `controller.enqueue()` on a closed `ReadableStream` controller, causing `TypeError [ERR_INVALID_STATE]: Invalid state: Controller is already closed` and crashing `server.js`.

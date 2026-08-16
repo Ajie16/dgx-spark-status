@@ -27,57 +27,140 @@
     }
   });
 
-  // History for sparklines (last 60 data points = 60 seconds)
+  // 60-point 1s sparklines for the metric cards
   const HISTORY_LEN = 60;
-  const HISTORY_KEY = 'dgx-history';
+  // Time-based chart series. chartAgg holds 1-min averages from the server;
+  // chartLive holds 1s samples received since this page connected. Points are
+  // positioned on the x-axis by their real timestamp, so both precisions mix
+  // without distorting the time axis.
+  const CHART_AGG_MAX = 24 * 60;                 // 24h of 1-min points
+  const CHART_LIVE_MAX_AGE = 10 * 60 * 1000;     // keep live 1s points 10 min
+  const CHART_RANGES = [1, 6, 24];
   let cpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let gpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let netRxHistory = $state(Array(HISTORY_LEN).fill(0));
   let netTxHistory = $state(Array(HISTORY_LEN).fill(0));
-  let gpuPowerHistory = $state(Array(HISTORY_LEN).fill(0));
-  let gpuTempHistory = $state(Array(HISTORY_LEN).fill(0));
-  let cpuTempHistory = $state(Array(HISTORY_LEN).fill(0));
+  let chartAgg = $state([]);     // {t, gpuPower, gpuTemp, cpuTemp}
+  let chartLive = $state([]);    // {t, gpuPower, gpuTemp, cpuTemp}
+  let chartRangeH = $state(1);   // chart time window: 1 / 6 / 24 hours (default 1h)
+  let historyRefreshTimer = null;
 
-  function pushHistory(arr, val) {
-    return [...arr.slice(1), val];
+  function pushHistory(arr, val, max = HISTORY_LEN) {
+    const next = arr.length >= max ? arr.slice(arr.length - max + 1) : arr.slice();
+    next.push(val);
+    return next;
   }
 
-  function loadHistory() {
+  function padTo(arr, len) {
+    return [...Array(Math.max(0, len - arr.length)).fill(0), ...arr.slice(-len)];
+  }
+
+  function toChartPoint(p) {
+    return {
+      t: typeof p.t === 'number' ? p.t : null,
+      gpuPower: p.gpuPower ?? null,
+      gpuTemp: p.gpuTemp ?? null,
+      cpuTemp: p.cpuTemp ?? null
+    };
+  }
+
+  // Seed charts from server-side history (survives refresh and server restart)
+  async function loadServerHistory() {
     try {
-      const saved = localStorage.getItem(HISTORY_KEY);
-      if (saved) {
-        const data = JSON.parse(saved);
-        cpuHistory = data.cpu || Array(HISTORY_LEN).fill(0);
-        gpuHistory = data.gpu || Array(HISTORY_LEN).fill(0);
-        netRxHistory = data.netRx || Array(HISTORY_LEN).fill(0);
-        netTxHistory = data.netTx || Array(HISTORY_LEN).fill(0);
-        gpuPowerHistory = data.gpuPower || Array(HISTORY_LEN).fill(0);
-        gpuTempHistory = data.gpuTemp || Array(HISTORY_LEN).fill(0);
-        cpuTempHistory = data.cpuTemp || Array(HISTORY_LEN).fill(0);
+      const res = await fetch('/api/history?hours=24');
+      if (!res.ok) return;
+      const data = await res.json();
+      chartAgg = (data.agg || [])
+        .map(toChartPoint)
+        .filter(p => p.t !== null)
+        .slice(-CHART_AGG_MAX);
+      const live = (data.raw || []).map(toChartPoint).filter(p => p.t !== null);
+      if (live.length > 0) chartLive = live;
+      const raw = (data.raw || []).slice(-HISTORY_LEN);
+      if (raw.length > 0) {
+        cpuHistory = padTo(raw.map(p => p.cpu ?? 0), HISTORY_LEN);
+        gpuHistory = padTo(raw.map(p => p.gpu ?? 0), HISTORY_LEN);
       }
     } catch (e) {
-      console.error('Failed to load history:', e);
+      console.error('Failed to load server history:', e);
     }
   }
 
-  function saveHistory() {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify({
-        cpu: cpuHistory,
-        gpu: gpuHistory,
-        netRx: netRxHistory,
-        netTx: netTxHistory,
-        gpuPower: gpuPowerHistory,
-        gpuTemp: gpuTempHistory,
-        cpuTemp: cpuTempHistory
-      }));
-    } catch (e) {
-      console.error('Failed to save history:', e);
+  // Live 1s samples, deduplicated by timestamp and trimmed to 10 minutes.
+  function pushLivePoint(p) {
+    if (p.t == null) return;
+    let next = chartLive.filter(q => q.t !== p.t);
+    next.push(p);
+    const cutoff = p.t - CHART_LIVE_MAX_AGE;
+    while (next.length && next[0].t < cutoff) next.shift();
+    chartLive = next;
+  }
+
+  // Merge server 1-min points with live 1s points for the selected window,
+  // sorted by timestamp. Live samples win on exact timestamp collisions.
+  function visibleChartPoints() {
+    const cutoff = Date.now() - chartRangeH * 60 * 60 * 1000;
+    const map = new Map();
+    for (const p of chartAgg) if (p.t >= cutoff) map.set(p.t, p);
+    for (const p of chartLive) if (p.t >= cutoff) map.set(p.t, p);
+    return [...map.values()].sort((a, b) => a.t - b.t);
+  }
+
+  const chartView = $derived.by(() => visibleChartPoints());
+
+  // X is mapped from the real timestamp: window start → 0, now → width.
+  // Null values break the line instead of being drawn as zero.
+  function timeChartPath(points, w, h, key, opts = {}) {
+    const now = opts.now ?? Date.now();
+    const tStart = now - chartRangeH * 60 * 60 * 1000;
+    const span = Math.max(1, now - tStart);
+    const vals = points
+      .map(p => p[key])
+      .filter(v => typeof v === 'number' && Number.isFinite(v));
+    if (vals.length === 0) return '';
+    const max = opts.max ?? Math.max(...vals, 1);
+    const x = t => ((t - tStart) / span) * w;
+    let d = '';
+    let pen = false;
+    for (const p of points) {
+      const v = p[key];
+      if (typeof v !== 'number' || !Number.isFinite(v)) { pen = false; continue; }
+      d += `${pen ? 'L' : 'M'}${x(p.t).toFixed(1)},${(h - (v / max) * h).toFixed(1)} `;
+      pen = true;
     }
+    return d.trim();
+  }
+
+  function timeChartArea(points, w, h, key, opts = {}) {
+    const line = timeChartPath(points, w, h, key, opts);
+    if (!line) return '';
+    const now = opts.now ?? Date.now();
+    const tStart = now - chartRangeH * 60 * 60 * 1000;
+    const span = Math.max(1, now - tStart);
+    const x = t => ((t - tStart) / span) * w;
+    const valid = points.filter(p => typeof p[key] === 'number' && Number.isFinite(p[key]));
+    const first = valid[0];
+    const last = valid[valid.length - 1];
+    return `${line} L${x(last.t).toFixed(1)},${h} L${x(first.t).toFixed(1)},${h} Z`;
+  }
+
+  function chartMaxTemp(points) {
+    const vals = points
+      .flatMap(p => [p.gpuTemp, p.cpuTemp])
+      .filter(v => typeof v === 'number' && Number.isFinite(v));
+    return Math.max(...vals, 1);
+  }
+
+  function formatTick(t, withDate) {
+    const opts = withDate
+      ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
+      : { hour: '2-digit', minute: '2-digit' };
+    return new Date(t).toLocaleString([], opts);
   }
 
   onMount(() => {
-    loadHistory();
+    loadServerHistory();
+    historyRefreshTimer = setInterval(loadServerHistory, 60 * 1000);
     unsubscribe = subscribe((message) => {
       if (message.type === 'connected') {
         connected = true;
@@ -90,10 +173,12 @@
         const net = message.data.network?.find(n => n.iface === 'all') || message.data.network?.[0];
         netRxHistory = pushHistory(netRxHistory, net?.rx_sec_mb || 0);
         netTxHistory = pushHistory(netTxHistory, net?.tx_sec_mb || 0);
-        gpuPowerHistory = pushHistory(gpuPowerHistory, message.data.gpu?.[0]?.powerDraw || 0);
-        gpuTempHistory = pushHistory(gpuTempHistory, message.data.gpu?.[0]?.temperatureGpu || 0);
-        cpuTempHistory = pushHistory(cpuTempHistory, message.data.cpu?.temperature || 0);
-        saveHistory();
+        pushLivePoint({
+          t: message.data.timestamp,
+          gpuPower: message.data.gpu?.[0]?.powerDraw ?? null,
+          gpuTemp: message.data.gpu?.[0]?.temperatureGpu ?? null,
+          cpuTemp: message.data.cpu?.temperature ?? null
+        });
       }
     });
     metrics = getCurrentMetrics();
@@ -102,6 +187,7 @@
 
   onDestroy(() => {
     if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    if (historyRefreshTimer) { clearInterval(historyRefreshTimer); historyRefreshTimer = null; }
   });
 
   // Notes
@@ -130,7 +216,7 @@
 
   // Sparkline path generator
   function sparklinePath(data, w, h) {
-    if (!data || data.length === 0) return '';
+    if (!data || data.length < 2) return '';
     const max = Math.max(...data, 1);
     const step = w / (data.length - 1);
     return data.map((v, i) => {
@@ -150,6 +236,11 @@
     return (bytes / (1024 ** 3)).toFixed(2);
   }
 
+  function formatClock(mhz) {
+    if (mhz == null || !Number.isFinite(mhz)) return '';
+    return mhz >= 1000 ? `${(mhz / 1000).toFixed(2)} GHz` : `${mhz.toFixed(0)} MHz`;
+  }
+
   function formatUptime(uptime) {
     if (!uptime) return '';
     const parts = [];
@@ -157,6 +248,49 @@
     if (uptime.hours) parts.push(`${uptime.hours}h`);
     parts.push(`${uptime.minutes}m`);
     return parts.join(' ');
+  }
+
+  function formatDuration(ms) {
+    if (ms == null || ms < 0) return '';
+    const m = Math.floor(ms / 60000);
+    if (m < 1) return '<1m';
+    const h = Math.floor(m / 60);
+    const d = Math.floor(h / 24);
+    if (d) return `${d}d ${h % 24}h`;
+    if (h) return `${h}h ${m % 60}m`;
+    return `${m}m`;
+  }
+
+  // One-line availability summary for an inference engine
+  function healthText(h, now) {
+    if (!h) return '';
+    const dur = formatDuration(Math.max(0, now - h.since));
+    let s = h.online ? `Up ${dur}` : `Down ${dur}`;
+    if (h.downCount > 0) {
+      s += ` · ${h.downCount} outage${h.downCount > 1 ? 's' : ''}`;
+      if (h.lastDownAt) {
+        s += ` (last ${new Date(h.lastDownAt).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })})`;
+      }
+    }
+    return s;
+  }
+
+  // Human-readable text for a system event
+  function eventText(ev) {
+    switch (ev.type) {
+      case 'boot':
+        return 'Dashboard service started';
+      case 'unclean_shutdown':
+        return ev.at
+          ? `Possible crash / power loss — last data ${new Date(ev.at).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}`
+          : 'Possible crash / power loss before this boot';
+      case 'throttle_start':
+        return `GPU throttling started — ${(ev.reasons || []).join(', ') || 'unknown'}${ev.temp != null ? ` (GPU ${ev.temp}°C)` : ''}`;
+      case 'throttle_end':
+        return `GPU throttling ended after ${formatDuration(ev.durationMs)}${ev.peakTemp != null ? ` (peak ${ev.peakTemp}°C)` : ''}`;
+      default:
+        return ev.type;
+    }
   }
 </script>
 
@@ -245,6 +379,14 @@
               <div class="stat-main">{gpu.model}</div>
               <div class="stat-sub">
                 {#if gpu.temperatureGpu !== null}{gpu.temperatureGpu}°C{/if}
+                {#if gpu.clocksGraphics !== null || gpu.clocksSm !== null}
+                  {#if gpu.temperatureGpu !== null} · {/if}
+                  {formatClock(gpu.clocksGraphics ?? gpu.clocksSm)}
+                {/if}
+                {#if gpu.clockLimitMax !== null}
+                  {#if gpu.temperatureGpu !== null || gpu.clocksGraphics !== null || gpu.clocksSm !== null} · {/if}
+                  cap {formatClock(gpu.clockLimitMax)}
+                {/if}
               </div>
               {#if !gpu.unifiedMemory && gpu.memoryTotalGB !== null}
                 <div class="stat-sub mono">
@@ -252,6 +394,12 @@
                 </div>
               {:else}
                 <div class="stat-sub">Unified Memory Architecture</div>
+              {/if}
+              {#if gpu.throttleReasons?.warnings?.length}
+                <div class="stat-sub throttle-warning">⚠ {gpu.throttleReasons.warnings.join(' · ')}</div>
+              {/if}
+              {#if gpu.throttleReasons?.info?.length}
+                <div class="stat-sub throttle-info">{gpu.throttleReasons.info.join(' · ')}</div>
               {/if}
             </div>
           </div>
@@ -313,6 +461,26 @@
               <span><span class="mem-dot free"></span>Free {disk.availableGB} GB</span>
             </div>
             <div class="stat-sub mono">{disk.fs} · {disk.type} · {disk.mount}</div>
+            {#if metrics.diskIO}
+              <div class="disk-io-row">
+                <span class="disk-io-item">
+                  <span class="disk-io-label">Read</span>
+                  <span class="disk-io-value read">{metrics.diskIO.readMBs?.toFixed(1) ?? '—'}</span>
+                  <span class="disk-io-unit">MB/s</span>
+                </span>
+                <span class="disk-io-item">
+                  <span class="disk-io-label">Write</span>
+                  <span class="disk-io-value write">{metrics.diskIO.writeMBs?.toFixed(1) ?? '—'}</span>
+                  <span class="disk-io-unit">MB/s</span>
+                </span>
+                {#if metrics.diskIO.temp !== null && metrics.diskIO.temp !== undefined}
+                  <span class="disk-io-item">
+                    <span class="disk-io-label">NVMe</span>
+                    <span class="disk-io-value temp">{metrics.diskIO.temp}°C</span>
+                  </span>
+                {/if}
+              </div>
+            {/if}
           </div>
         </div>
       {/if}
@@ -362,6 +530,7 @@
     <!-- Row 2: Power & Temperature Charts -->
     {#if metrics.gpu && metrics.gpu.length > 0}
       {@const gpu = metrics.gpu[0]}
+      {@const tempMax = chartMaxTemp(chartView)}
       <div class="charts-grid">
         <!-- Power Chart -->
         <div class="card chart-card">
@@ -384,13 +553,17 @@
               <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
               <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
               <!-- Area -->
-              <path d={sparklineArea(gpuPowerHistory, 400, 120)} fill="rgba(255, 159, 10, 0.08)" />
+              <path d={timeChartArea(chartView, 400, 120, 'gpuPower')} fill="rgba(255, 159, 10, 0.08)" />
               <!-- Line -->
-              <path d={sparklinePath(gpuPowerHistory, 400, 120)} fill="none" stroke="#ff9f0a" stroke-width="2" />
+              <path d={timeChartPath(chartView, 400, 120, 'gpuPower')} fill="none" stroke="#ff9f0a" stroke-width="2" />
             </svg>
           </div>
+          <div class="chart-ticks">
+            <span>{formatTick(Date.now() - chartRangeH * 3600 * 1000, chartRangeH >= 24)}</span>
+            <span>{formatTick(Date.now(), false)}</span>
+          </div>
           <div class="chart-labels">
-            <span>CPU + GPU + Memory</span>
+            <span>Power draw</span>
             {#if gpu.powerDrawAvg !== null}
               <span>Avg {gpu.powerDrawAvg.toFixed(1)}W</span>
             {/if}
@@ -422,22 +595,57 @@
               <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
               <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
               <!-- GPU temp area -->
-              <path d={sparklineArea(gpuTempHistory, 400, 120)} fill="rgba(255, 159, 10, 0.06)" />
+              <path d={timeChartArea(chartView, 400, 120, 'gpuTemp', { max: tempMax })} fill="rgba(255, 159, 10, 0.06)" />
               <!-- GPU temp line -->
-              <path d={sparklinePath(gpuTempHistory, 400, 120)} fill="none" stroke="#ff9f0a" stroke-width="2" />
+              <path d={timeChartPath(chartView, 400, 120, 'gpuTemp', { max: tempMax })} fill="none" stroke="#ff9f0a" stroke-width="2" />
               <!-- CPU temp line -->
-              <path d={sparklinePath(cpuTempHistory, 400, 120)} fill="none" stroke="#0a84ff" stroke-width="1.5" opacity="0.8" />
+              <path d={timeChartPath(chartView, 400, 120, 'cpuTemp', { max: tempMax })} fill="none" stroke="#0a84ff" stroke-width="1.5" opacity="0.8" />
             </svg>
+          </div>
+          <div class="chart-ticks">
+            <span>{formatTick(Date.now() - chartRangeH * 3600 * 1000, chartRangeH >= 24)}</span>
+            <span>{formatTick(Date.now(), false)}</span>
           </div>
           <div class="chart-labels">
             <span><span class="legend-dot gpu-temp-dot"></span>GPU</span>
             <span><span class="legend-dot cpu-temp-dot"></span>CPU</span>
+            <span>{chartRangeH}h</span>
           </div>
+        </div>
+      </div>
+      <div class="chart-controls">
+        <div class="range-toggle" role="group" aria-label="Chart time range">
+          {#each CHART_RANGES as r}
+            <button
+              class="range-btn {chartRangeH === r ? 'active' : ''}"
+              aria-pressed={chartRangeH === r}
+              onclick={() => (chartRangeH = r)}
+            >{r}h</button>
+          {/each}
         </div>
       </div>
     {/if}
 
-    <!-- Row 3: Processes -->
+    <!-- Row 3: System Events (boot / crash / throttling) -->
+    {#if metrics.events && metrics.events.length > 0}
+      <div class="card events-card">
+        <div class="section-header">
+          <h2>Events</h2>
+          <span class="section-sub">boot · crash · throttling</span>
+        </div>
+        <div class="events-list">
+          {#each [...metrics.events].reverse().slice(0, 8) as ev}
+            <div class="event-row">
+              <span class="event-dot {ev.type}"></span>
+              <span class="event-time">{new Date(ev.t).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</span>
+              <span class="event-text">{eventText(ev)}</span>
+            </div>
+          {/each}
+        </div>
+      </div>
+    {/if}
+
+    <!-- Row 4: Processes -->
     {#if metrics.processes && metrics.processes.length > 0}
       <div class="card processes-card">
         <div class="section-header">
@@ -482,6 +690,11 @@
               <span class="engine-pill stopped">Stopped</span>
             {/if}
           </div>
+          {#if metrics.inference.health?.llama}
+            <div class="engine-health {metrics.inference.health.llama.online ? 'online' : 'offline'}">
+              {healthText(metrics.inference.health.llama, metrics.timestamp)}
+            </div>
+          {/if}
           <div class="models-list">
             {#if metrics.inference.availableModels?.llama}
               {#each metrics.inference.availableModels.llama as model}
@@ -533,6 +746,11 @@
               <span class="engine-pill stopped">Stopped</span>
             {/if}
           </div>
+          {#if metrics.inference.health?.vllm}
+            <div class="engine-health {metrics.inference.health.vllm.online ? 'online' : 'offline'}">
+              {healthText(metrics.inference.health.vllm, metrics.timestamp)}
+            </div>
+          {/if}
           <div class="models-list">
             {#if metrics.inference.availableModels?.vllm && metrics.inference.availableModels.vllm.length > 0}
               {#each metrics.inference.availableModels.vllm as model}
@@ -582,6 +800,11 @@
                 <span class="engine-pill stopped">Stopped</span>
               {/if}
             </div>
+            {#if metrics.inference.health?.ollama}
+              <div class="engine-health {metrics.inference.health.ollama.online ? 'online' : 'offline'}">
+                {healthText(metrics.inference.health.ollama, metrics.timestamp)}
+              </div>
+            {/if}
             <div class="models-list">
               {#if metrics.inference.ollama.models && metrics.inference.ollama.models.length > 0}
                 {#each metrics.inference.ollama.models as model}
@@ -631,6 +854,11 @@
               <span class="engine-pill stopped">Stopped</span>
             {/if}
           </div>
+          {#if metrics.inference.health?.comfyui}
+            <div class="engine-health {metrics.inference.health.comfyui.online ? 'online' : 'offline'}">
+              {healthText(metrics.inference.health.comfyui, metrics.timestamp)}
+            </div>
+          {/if}
           <div class="models-list">
             {#if metrics.inference.comfyui?.running}
               <div class="model-item loaded">
@@ -1234,6 +1462,88 @@
     border: 1px solid rgba(255, 69, 58, 0.2);
   }
 
+  /* Engine availability line */
+  .engine-health {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+    margin: -0.35rem 0 0.6rem;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .engine-health::before {
+    content: '';
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .engine-health.online {
+    color: var(--text-secondary);
+  }
+
+  .engine-health.online::before {
+    background: #30d158;
+  }
+
+  .engine-health.offline {
+    color: #ff453a;
+    font-weight: 600;
+  }
+
+  .engine-health.offline::before {
+    background: #ff453a;
+  }
+
+  /* Disk I/O mini stats */
+  .disk-io-row {
+    display: flex;
+    justify-content: space-around;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--border-subtle);
+  }
+
+  .disk-io-item {
+    display: flex;
+    align-items: baseline;
+    gap: 0.25rem;
+  }
+
+  .disk-io-label {
+    font-size: 0.7rem;
+    color: var(--text-tertiary);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .disk-io-value {
+    font-size: 1rem;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .disk-io-value.read { color: #64d2ff; }
+  .disk-io-value.write { color: #30d158; }
+  .disk-io-value.temp { color: #bf5af2; }
+
+  .disk-io-unit {
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+  }
+
+  /* GPU throttle warning */
+  .throttle-warning {
+    color: #ff453a !important;
+    font-weight: 600;
+  }
+
+  /* Benign clock/power states (e.g. SW Power Cap on GB10) */
+  .throttle-info {
+    color: var(--text-secondary);
+  }
+
   .models-list {
     display: flex;
     flex-direction: column;
@@ -1469,6 +1779,51 @@
     color: var(--text-tertiary);
   }
 
+  .chart-ticks {
+    display: flex;
+    justify-content: space-between;
+    margin-top: 0.2rem;
+    font-size: 0.7rem;
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .chart-controls {
+    display: flex;
+    justify-content: center;
+    margin-bottom: 1rem;
+  }
+
+  .range-toggle {
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 999px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .range-btn {
+    border: none;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 0.35rem 1.1rem;
+    border-radius: 999px;
+    cursor: pointer;
+    font-variant-numeric: tabular-nums;
+    transition: background var(--transition-fast), color var(--transition-fast);
+  }
+
+  .range-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .range-btn.active {
+    background: var(--accent-blue);
+    color: #fff;
+  }
+
   .legend-dot {
     width: 8px;
     height: 8px;
@@ -1480,6 +1835,56 @@
 
   .legend-dot.gpu-temp-dot { background: #ff9f0a; }
   .legend-dot.cpu-temp-dot { background: #0a84ff; }
+
+  /* Events */
+  .events-card {
+    margin-bottom: 1rem;
+  }
+
+  .events-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+
+  .event-row {
+    display: flex;
+    align-items: baseline;
+    gap: 0.6rem;
+    font-size: 0.85rem;
+    padding: 0.3rem 0.5rem;
+    border-radius: var(--radius-sm);
+  }
+
+  .event-row:hover {
+    background: var(--bg-subtle);
+  }
+
+  .event-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    align-self: center;
+  }
+
+  .event-dot.boot { background: #0a84ff; }
+  .event-dot.unclean_shutdown { background: #ff453a; }
+  .event-dot.throttle_start { background: #ff9f0a; }
+  .event-dot.throttle_end { background: #30d158; }
+
+  .event-time {
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+    min-width: 7.5rem;
+  }
+
+  .event-text {
+    color: var(--text-secondary);
+  }
 
   /* Footer */
   .footer {

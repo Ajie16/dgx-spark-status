@@ -1,0 +1,22 @@
+[Unit]
+Description=DGX Spark Status Dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=xujie
+Group=xujie
+WorkingDirectory=/home/xujie/workspace/dgx-spark-status
+# Lock the GPU boost ceiling at every start (also on boot). The `+` prefix
+# runs nvidia-smi as root even though the service itself runs as xujie.
+Environment=GPU_CLOCK_LOCK=0,2200
+ExecStartPre=+/usr/bin/nvidia-smi -lgc ${GPU_CLOCK_LOCK}
+ExecStart=/home/xujie/tools/nodejs/node-v24.19.0-linux-arm64/bin/node dev-server.js
+Restart=always
+RestartSec=5
+# dev-server.js binds 0.0.0.0:9000 itself. NODE_ENV is intentionally unset so
+# the Vite dev middleware behaves exactly like ./start.sh (the known-good path).
+
+[Install]
+WantedBy=multi-user.target

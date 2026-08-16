@@ -63,11 +63,16 @@ node server.js
 
 ### Systemd Service
 
+The unit is named `dgx-spark-status.service` (not `dgx-dashboard.service`):
+on DGX Spark hosts that name is already taken by NVIDIA's preinstalled
+"DGX Dashboard Service" on port 11000.
+
 System-wide (requires sudo):
 
 ```bash
-sudo cp dgx-dashboard.service /etc/systemd/system/
-sudo systemctl enable --now dgx-dashboard
+sudo cp dgx-spark-status.service /etc/systemd/system/dgx-spark-status.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now dgx-spark-status
 ```
 
 User-level (no sudo, auto-starts at boot via lingering):
@@ -75,14 +80,29 @@ User-level (no sudo, auto-starts at boot via lingering):
 ```bash
 mkdir -p ~/.config/systemd/user
 sed '/^User=/d; s/WantedBy=multi-user.target/WantedBy=default.target/' \
-  dgx-dashboard.service > ~/.config/systemd/user/dgx-dashboard.service
+  dgx-spark-status.service > ~/.config/systemd/user/dgx-spark-status.service
 systemctl --user daemon-reload
-systemctl --user enable --now dgx-dashboard
+systemctl --user enable --now dgx-spark-status
 loginctl enable-linger $USER
 ```
 
-Manage with `systemctl --user status|stop|restart dgx-dashboard`
+Manage with `systemctl --user status|stop|restart dgx-spark-status`
 (or drop `--user` for the system-wide unit).
+
+### GPU clock cap
+
+The bundled unit locks the GPU boost ceiling on every start (including boot)
+with `nvidia-smi -lgc`. Change the range in the unit's `Environment` line:
+
+```ini
+[Service]
+Environment=GPU_CLOCK_LOCK=0,2200
+ExecStartPre=+/usr/bin/nvidia-smi -lgc ${GPU_CLOCK_LOCK}
+```
+
+`0,2200` means "no minimum, never boost above 2200 MHz". The `+` prefix runs
+`nvidia-smi` as root while the dashboard itself runs as `xujie`. The dashboard
+reads the same variable and shows the cap on the GPU card.
 
 ## Configuration
 
