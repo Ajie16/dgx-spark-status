@@ -27,7 +27,7 @@ Real-time system monitoring dashboard for NVIDIA DGX Spark (GB10) with Apple-sty
 - **Apple-style Glassmorphism** - Frosted glass cards with backdrop blur and soft shadows
 - **Dual Themes** - Dark and light modes with one-click toggle; preference persisted to localStorage
 - **History Persistence** - 60-second metric history saved to localStorage, survives page refresh
-- **Live Updates** - Server-Sent Events (SSE) for real-time metrics streaming (1s interval)
+- **Live Updates** - Server-Sent Events (SSE) for real-time metrics streaming (5s interval)
 - **Responsive Grid** - Auto-fitting card layout that adapts to screen size
 - **SVG Favicon** - Gauge-style icon with gradient arc
 
@@ -109,7 +109,7 @@ reads the same variable and shows the cap on the GPU card.
 ### Update Interval
 Modify `UPDATE_INTERVAL` in `dev-server.js`:
 ```javascript
-const UPDATE_INTERVAL = 1000; // milliseconds
+const UPDATE_INTERVAL = 5000; // milliseconds
 ```
 
 ### Port
@@ -210,7 +210,7 @@ NVIDIA DGX Spark (GB10) 即時系統監控面板，採用 Apple 風格 UI、亮�
 - **Apple 風格毛玻璃** - 半透明磨砂卡片、圓角與柔和陰影
 - **亮暗雙主題** - 一鍵切換深色/淺色模式，偏好自動保存
 - **歷史持久化** - 60 秒指標歷史存入 localStorage，重新整理不遺失
-- **即時更新** - Server-Sent Events (SSE) 每秒串流更新
+- **即時更新** - Server-Sent Events (SSE) 每 5 秒串流更新
 - **響應式排版** - 自動適應螢幕大小的卡片式排版
 - **SVG 圖示** - 儀表板風格漸層圖示
 

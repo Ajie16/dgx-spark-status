@@ -56,6 +56,7 @@ metrics-history.json
 metrics-history.jsonl
 service-health.json
 system-events.json
+fan-control.json
 .clean-shutdown
 
 # Claude Code

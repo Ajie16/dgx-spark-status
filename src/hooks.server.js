@@ -1,6 +1,6 @@
 import si from 'systeminformation';
 
-const UPDATE_INTERVAL = 1000; // Update every 1 second
+const UPDATE_INTERVAL = 5000; // Update every 5 seconds
 
 // Store active SSE clients
 const sseClients = new Set();

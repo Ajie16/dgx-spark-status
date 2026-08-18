@@ -3,7 +3,7 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
-const UPDATE_INTERVAL = 1000;
+const UPDATE_INTERVAL = 5000;
 const LLAMA_PROXY = 'http://127.0.0.1:8000';
 const LLAMA_SERVER = 'http://127.0.0.1:8001';
 

@@ -16,6 +16,39 @@
     localStorage.setItem('dgx-theme', theme);
   }
 
+  let comfyBusy = $state(false);
+
+  async function controlComfy(action) {
+    if (comfyBusy) return;
+    comfyBusy = true;
+    try {
+      const res = await fetch('/api/comfyui', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action })
+      });
+      const data = await res.json();
+      if (data.comfyui && metrics?.inference) {
+        metrics.inference.comfyui = { ...metrics.inference.comfyui, ...data.comfyui };
+      }
+    } catch (e) {
+    } finally {
+      comfyBusy = false;
+    }
+  }
+
+  async function setFanMode(mode) {
+    try {
+      const res = await fetch('/api/fan', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
+      const data = await res.json();
+      if (data.fan && metrics) metrics.fan = data.fan;
+    } catch (e) {}
+  }
+
   onMount(() => {
     const saved = localStorage.getItem('dgx-theme');
     if (saved === 'light' || saved === 'dark') {
@@ -27,22 +60,28 @@
     }
   });
 
-  // 60-point 1s sparklines for the metric cards
+  // 60-point 5s sparklines for the metric cards
   const HISTORY_LEN = 60;
   // Time-based chart series. chartAgg holds 1-min averages from the server;
-  // chartLive holds 1s samples received since this page connected. Points are
+  // chartLive holds 5s samples received since this page connected. Points are
   // positioned on the x-axis by their real timestamp, so both precisions mix
   // without distorting the time axis.
   const CHART_AGG_MAX = 24 * 60;                 // 24h of 1-min points
-  const CHART_LIVE_MAX_AGE = 10 * 60 * 1000;     // keep live 1s points 10 min
-  const CHART_RANGES = [1, 6, 24];
+  const CHART_LIVE_MAX_AGE = 10 * 60 * 1000;     // keep live 5s points 10 min
+  const CHART_RANGES = [
+    { value: 1 / 6, label: '10m' },
+    { value: 1, label: '1h' },
+    { value: 6, label: '6h' },
+    { value: 24, label: '24h' }
+  ];
+  const CHART_HEADROOM = 1.12;                   // leave room so peaks aren't clipped
   let cpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let gpuHistory = $state(Array(HISTORY_LEN).fill(0));
   let netRxHistory = $state(Array(HISTORY_LEN).fill(0));
   let netTxHistory = $state(Array(HISTORY_LEN).fill(0));
   let chartAgg = $state([]);     // {t, gpuPower, gpuTemp, cpuTemp}
   let chartLive = $state([]);    // {t, gpuPower, gpuTemp, cpuTemp}
-  let chartRangeH = $state(1);   // chart time window: 1 / 6 / 24 hours (default 1h)
+  let chartRangeH = $state(1 / 6); // chart window in hours (default 10 min)
   let historyRefreshTimer = null;
 
   function pushHistory(arr, val, max = HISTORY_LEN) {
@@ -60,7 +99,8 @@
       t: typeof p.t === 'number' ? p.t : null,
       gpuPower: p.gpuPower ?? null,
       gpuTemp: p.gpuTemp ?? null,
-      cpuTemp: p.cpuTemp ?? null
+      cpuTemp: p.cpuTemp ?? null,
+      fan: p.fan === 1 || p.fan === 'on' ? 1 : p.fan === 0 || p.fan === 'off' ? 0 : null
     };
   }
 
@@ -86,7 +126,7 @@
     }
   }
 
-  // Live 1s samples, deduplicated by timestamp and trimmed to 10 minutes.
+  // Live 5s samples, deduplicated by timestamp and trimmed to 10 minutes.
   function pushLivePoint(p) {
     if (p.t == null) return;
     let next = chartLive.filter(q => q.t !== p.t);
@@ -118,7 +158,7 @@
       .map(p => p[key])
       .filter(v => typeof v === 'number' && Number.isFinite(v));
     if (vals.length === 0) return '';
-    const max = opts.max ?? Math.max(...vals, 1);
+    const max = (opts.max ?? Math.max(...vals, 1)) * CHART_HEADROOM;
     const x = t => ((t - tStart) / span) * w;
     let d = '';
     let pen = false;
@@ -151,11 +191,97 @@
     return Math.max(...vals, 1);
   }
 
+  function chartSeriesMax(points, key) {
+    const vals = points
+      .map(p => p[key])
+      .filter(v => typeof v === 'number' && Number.isFinite(v));
+    if (!vals.length) return null;
+    return Math.max(...vals, 1);
+  }
+
+  function axisValue(v) {
+    if (v == null || !Number.isFinite(v)) return '—';
+    return v >= 100 ? String(Math.round(v)) : String(Math.round(v * 10) / 10);
+  }
+
+  function peakOf(points, key) {
+    let best = null;
+    for (const p of points) {
+      const v = p[key];
+      if (typeof v === 'number' && Number.isFinite(v) && (!best || v > best.v)) {
+        best = { t: p.t, v };
+      }
+    }
+    return best;
+  }
+
+  function chartPointXY(t, v, w, h, max, now = Date.now()) {
+    const tStart = now - chartRangeH * 60 * 60 * 1000;
+    const span = Math.max(1, now - tStart);
+    return {
+      x: ((t - tStart) / span) * w,
+      y: h - (v / max) * h
+    };
+  }
+
   function formatTick(t, withDate) {
     const opts = withDate
       ? { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }
       : { hour: '2-digit', minute: '2-digit' };
     return new Date(t).toLocaleString([], opts);
+  }
+
+  function rangeLabel(h) {
+    return h < 1 ? `${Math.round(h * 60)}m` : `${Math.round(h)}h`;
+  }
+
+  // Merge consecutive fan on/off samples into chart-space bands.
+  // Falls back to fan_on / fan_off events when history predates the fan field.
+  function fanBands(points, w = 400, now = Date.now()) {
+    const tStart = now - chartRangeH * 60 * 60 * 1000;
+    const span = Math.max(1, now - tStart);
+    const samples = [];
+    for (const p of points) {
+      if (p.t == null || p.t < tStart) continue;
+      if (p.fan === 1 || p.fan === 0) samples.push({ t: p.t, state: p.fan === 1 ? 'on' : 'off' });
+    }
+    if (samples.length === 0 && metrics?.events) {
+      const evs = [...metrics.events]
+        .filter(e => e.type === 'fan_on' || e.type === 'fan_off')
+        .sort((a, b) => a.t - b.t);
+      for (const ev of evs) {
+        samples.push({ t: ev.t, state: ev.type === 'fan_on' ? 'on' : 'off' });
+      }
+    }
+    const live = metrics?.fan?.state;
+    if (live === 'on' || live === 'off') {
+      if (!samples.length || samples[samples.length - 1].t < now) {
+        samples.push({ t: now, state: live });
+      } else {
+        samples[samples.length - 1].state = live;
+      }
+    }
+    if (!samples.length) return [];
+    const segs = [];
+    let cur = { state: samples[0].state, t0: Math.max(samples[0].t, tStart) };
+    for (let i = 1; i < samples.length; i++) {
+      if (samples[i].state !== cur.state) {
+        segs.push({ ...cur, t1: samples[i].t });
+        cur = { state: samples[i].state, t0: samples[i].t };
+      }
+    }
+    segs.push({ ...cur, t1: now });
+    return segs.map(s => {
+      const x0 = ((s.t0 - tStart) / span) * w;
+      const x1 = ((s.t1 - tStart) / span) * w;
+      return { state: s.state, x: x0, w: Math.max(0.4, x1 - x0) };
+    }).filter(s => s.w > 0 && s.x < w);
+  }
+
+  function thresholdY(temp, scale, h = 120) {
+    if (temp == null || scale == null || scale <= 0) return null;
+    const y = h - (temp / scale) * h;
+    return y >= 0 && y <= h ? y : null;
   }
 
   onMount(() => {
@@ -177,7 +303,8 @@
           t: message.data.timestamp,
           gpuPower: message.data.gpu?.[0]?.powerDraw ?? null,
           gpuTemp: message.data.gpu?.[0]?.temperatureGpu ?? null,
-          cpuTemp: message.data.cpu?.temperature ?? null
+          cpuTemp: message.data.cpu?.temperature ?? null,
+          fan: message.data.fan?.state === 'on' ? 1 : message.data.fan?.state === 'off' ? 0 : null
         });
       }
     });
@@ -288,6 +415,16 @@
         return `GPU throttling started — ${(ev.reasons || []).join(', ') || 'unknown'}${ev.temp != null ? ` (GPU ${ev.temp}°C)` : ''}`;
       case 'throttle_end':
         return `GPU throttling ended after ${formatDuration(ev.durationMs)}${ev.peakTemp != null ? ` (peak ${ev.peakTemp}°C)` : ''}`;
+      case 'fan_on':
+        return `Cooling fan on${ev.reason ? ` — ${ev.reason}` : ''}`;
+      case 'fan_off':
+        return `Cooling fan off${ev.reason ? ` — ${ev.reason}` : ''}`;
+      case 'fan_error':
+        return `Cooling fan error${ev.error ? ` — ${ev.error}` : ''}`;
+      case 'comfy_start':
+        return `ComfyUI starting${ev.pid ? ` (pid ${ev.pid})` : ''}`;
+      case 'comfy_stop':
+        return `ComfyUI stop requested`;
       default:
         return ev.type;
     }
@@ -400,6 +537,20 @@
               {/if}
               {#if gpu.throttleReasons?.info?.length}
                 <div class="stat-sub throttle-info">{gpu.throttleReasons.info.join(' · ')}</div>
+              {/if}
+              {#if metrics.fan}
+                <div class="fan-row">
+                  <span class="fan-label">Fan {metrics.fan.state ?? '…'}{metrics.fan.reason && metrics.fan.reason !== 'hysteresis' ? ` · ${metrics.fan.reason}` : ''}</span>
+                  <div class="fan-modes">
+                    {#each ['auto', 'on', 'off'] as mode}
+                      <button
+                        type="button"
+                        class="fan-mode {metrics.fan.mode === mode ? 'active' : ''}"
+                        onclick={() => setFanMode(mode)}
+                      >{mode}</button>
+                    {/each}
+                  </div>
+                </div>
               {/if}
             </div>
           </div>
@@ -531,6 +682,15 @@
     {#if metrics.gpu && metrics.gpu.length > 0}
       {@const gpu = metrics.gpu[0]}
       {@const tempMax = chartMaxTemp(chartView)}
+      {@const powerMax = chartSeriesMax(chartView, 'gpuPower')}
+      {@const powerPeak = peakOf(chartView, 'gpuPower')}
+      {@const gpuPeak = peakOf(chartView, 'gpuTemp')}
+      {@const cpuPeak = peakOf(chartView, 'cpuTemp')}
+      {@const powerScale = powerMax !== null ? powerMax * CHART_HEADROOM : null}
+      {@const tempScale = tempMax * CHART_HEADROOM}
+      {@const bands = fanBands(chartView)}
+      {@const yOn = thresholdY(metrics.fan?.thresholds?.on?.gpu ?? 65, tempScale)}
+      {@const yOff = thresholdY(metrics.fan?.thresholds?.off?.gpu ?? 52, tempScale)}
       <div class="charts-grid">
         <!-- Power Chart -->
         <div class="card chart-card">
@@ -546,32 +706,43 @@
               {/if}
             </div>
           </div>
-          <div class="chart-container">
-            <svg viewBox="0 0 400 120" preserveAspectRatio="none" class="chart-svg">
-              <!-- Grid lines -->
-              <line x1="0" y1="30" x2="400" y2="30" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
-              <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
-              <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
-              <!-- Area -->
-              <path d={timeChartArea(chartView, 400, 120, 'gpuPower')} fill="rgba(255, 159, 10, 0.08)" />
-              <!-- Line -->
-              <path d={timeChartPath(chartView, 400, 120, 'gpuPower')} fill="none" stroke="#ff9f0a" stroke-width="2" />
-            </svg>
+          <div class="chart-plot">
+            <div class="chart-y-axis" aria-hidden="true">
+              <span>{axisValue(powerScale)}</span>
+              <span>{axisValue(powerScale !== null ? powerScale * 0.75 : null)}</span>
+              <span>{axisValue(powerScale !== null ? powerScale * 0.5 : null)}</span>
+              <span>{axisValue(powerScale !== null ? powerScale * 0.25 : null)}</span>
+              <span>0</span>
+            </div>
+            <div class="chart-container">
+              <svg viewBox="0 0 400 120" preserveAspectRatio="none" class="chart-svg">
+                <!-- Grid lines -->
+                <line x1="0" y1="30" x2="400" y2="30" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+                <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+                <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+                <!-- Baseline -->
+                <line x1="0" y1="120" x2="400" y2="120" stroke="var(--border-color)" stroke-width="1" />
+                <!-- Area -->
+                <path d={timeChartArea(chartView, 400, 120, 'gpuPower')} fill="rgba(255, 159, 10, 0.08)" />
+                <!-- Line -->
+                <path d={timeChartPath(chartView, 400, 120, 'gpuPower')} fill="none" stroke="#ff9f0a" stroke-width="2" />
+                {#if powerPeak}
+                  {@const pp = chartPointXY(powerPeak.t, powerPeak.v, 400, 120, powerScale)}
+                  <line x1={pp.x.toFixed(1)} y1={pp.y.toFixed(1)} x2={pp.x.toFixed(1)} y2="120" stroke="#ff9f0a" stroke-width="1" stroke-dasharray="3 4" opacity="0.3" />
+                  <circle cx={pp.x.toFixed(1)} cy={pp.y.toFixed(1)} r="7" fill="rgba(255, 159, 10, 0.18)" />
+                  <circle cx={pp.x.toFixed(1)} cy={pp.y.toFixed(1)} r="3.6" fill="#ff9f0a" stroke="var(--bg-primary)" stroke-width="1.5" />
+                {/if}
+              </svg>
+            </div>
           </div>
           <div class="chart-ticks">
             <span>{formatTick(Date.now() - chartRangeH * 3600 * 1000, chartRangeH >= 24)}</span>
             <span>{formatTick(Date.now(), false)}</span>
           </div>
           <div class="chart-labels">
-            <span>Power draw</span>
-            {#if gpu.powerDrawAvg !== null}
-              <span>Avg {gpu.powerDrawAvg.toFixed(1)}W</span>
-            {/if}
-            {#if gpu.powerLimit !== null}
-              <span>{gpu.powerLimit}W</span>
-            {:else}
-              <span>Max</span>
-            {/if}
+            <span><span class="legend-dot power-dot"></span>Peak {powerPeak ? `${axisValue(powerPeak.v)}W` : '—'}</span>
+            <span>Avg {gpu.powerDrawAvg !== null ? `${gpu.powerDrawAvg.toFixed(1)}W` : '—'}</span>
+            <span>{gpu.powerLimit !== null ? `${gpu.powerLimit}W` : 'Max'}</span>
           </div>
         </div>
 
@@ -588,28 +759,80 @@
               {/if}
             </div>
           </div>
-          <div class="chart-container">
-            <svg viewBox="0 0 400 120" preserveAspectRatio="none" class="chart-svg">
-              <!-- Grid lines -->
-              <line x1="0" y1="30" x2="400" y2="30" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
-              <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
-              <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
-              <!-- GPU temp area -->
-              <path d={timeChartArea(chartView, 400, 120, 'gpuTemp', { max: tempMax })} fill="rgba(255, 159, 10, 0.06)" />
-              <!-- GPU temp line -->
-              <path d={timeChartPath(chartView, 400, 120, 'gpuTemp', { max: tempMax })} fill="none" stroke="#ff9f0a" stroke-width="2" />
-              <!-- CPU temp line -->
-              <path d={timeChartPath(chartView, 400, 120, 'cpuTemp', { max: tempMax })} fill="none" stroke="#0a84ff" stroke-width="1.5" opacity="0.8" />
-            </svg>
+          <div class="chart-plot">
+            <div class="chart-y-axis" aria-hidden="true">
+              <span>{axisValue(tempScale)}</span>
+              <span>{axisValue(tempScale * 0.75)}</span>
+              <span>{axisValue(tempScale * 0.5)}</span>
+              <span>{axisValue(tempScale * 0.25)}</span>
+              <span>0</span>
+            </div>
+            <div class="chart-container">
+              <svg viewBox="0 0 400 120" preserveAspectRatio="none" class="chart-svg">
+                <!-- Fan on/off wash (behind the temperature series) -->
+                {#each bands as b}
+                  <rect
+                    x={b.x.toFixed(2)}
+                    y="0"
+                    width={b.w.toFixed(2)}
+                    height="120"
+                    class={b.state === 'on' ? 'fan-band-on' : 'fan-band-off'}
+                  />
+                {/each}
+                <!-- Grid lines -->
+                <line x1="0" y1="30" x2="400" y2="30" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+                <line x1="0" y1="60" x2="400" y2="60" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+                <line x1="0" y1="90" x2="400" y2="90" stroke="var(--border-subtle)" stroke-width="0.5" stroke-dasharray="4" />
+                <!-- Fan switch thresholds -->
+                {#if yOn != null}
+                  <line x1="0" y1={yOn.toFixed(1)} x2="400" y2={yOn.toFixed(1)} class="fan-threshold-on" />
+                {/if}
+                {#if yOff != null}
+                  <line x1="0" y1={yOff.toFixed(1)} x2="400" y2={yOff.toFixed(1)} class="fan-threshold-off" />
+                {/if}
+                <!-- Baseline -->
+                <line x1="0" y1="120" x2="400" y2="120" stroke="var(--border-color)" stroke-width="1" />
+                <!-- GPU temp area -->
+                <path d={timeChartArea(chartView, 400, 120, 'gpuTemp', { max: tempMax })} fill="rgba(255, 159, 10, 0.06)" />
+                <!-- GPU temp line -->
+                <path d={timeChartPath(chartView, 400, 120, 'gpuTemp', { max: tempMax })} fill="none" stroke="#ff9f0a" stroke-width="2" />
+                <!-- CPU temp line -->
+                <path d={timeChartPath(chartView, 400, 120, 'cpuTemp', { max: tempMax })} fill="none" stroke="#0a84ff" stroke-width="1.5" opacity="0.8" />
+                {#if gpuPeak}
+                  {@const gp = chartPointXY(gpuPeak.t, gpuPeak.v, 400, 120, tempScale)}
+                  <line x1={gp.x.toFixed(1)} y1={gp.y.toFixed(1)} x2={gp.x.toFixed(1)} y2="120" stroke="#ff9f0a" stroke-width="1" stroke-dasharray="3 4" opacity="0.3" />
+                  <circle cx={gp.x.toFixed(1)} cy={gp.y.toFixed(1)} r="7" fill="rgba(255, 159, 10, 0.18)" />
+                  <circle cx={gp.x.toFixed(1)} cy={gp.y.toFixed(1)} r="3.6" fill="#ff9f0a" stroke="var(--bg-primary)" stroke-width="1.5" />
+                {/if}
+                {#if cpuPeak}
+                  {@const cp = chartPointXY(cpuPeak.t, cpuPeak.v, 400, 120, tempScale)}
+                  <line x1={cp.x.toFixed(1)} y1={cp.y.toFixed(1)} x2={cp.x.toFixed(1)} y2="120" stroke="#0a84ff" stroke-width="1" stroke-dasharray="3 4" opacity="0.3" />
+                  <circle cx={cp.x.toFixed(1)} cy={cp.y.toFixed(1)} r="7" fill="rgba(10, 132, 255, 0.18)" />
+                  <circle cx={cp.x.toFixed(1)} cy={cp.y.toFixed(1)} r="3.6" fill="#0a84ff" stroke="var(--bg-primary)" stroke-width="1.5" />
+                {/if}
+                <!-- Fan state strip along the baseline -->
+                {#each bands as b}
+                  <rect
+                    x={b.x.toFixed(2)}
+                    y="113"
+                    width={b.w.toFixed(2)}
+                    height="7"
+                    rx="0.5"
+                    class={b.state === 'on' ? 'fan-strip-on' : 'fan-strip-off'}
+                  />
+                {/each}
+              </svg>
+            </div>
           </div>
           <div class="chart-ticks">
             <span>{formatTick(Date.now() - chartRangeH * 3600 * 1000, chartRangeH >= 24)}</span>
             <span>{formatTick(Date.now(), false)}</span>
           </div>
           <div class="chart-labels">
-            <span><span class="legend-dot gpu-temp-dot"></span>GPU</span>
-            <span><span class="legend-dot cpu-temp-dot"></span>CPU</span>
-            <span>{chartRangeH}h</span>
+            <span><span class="legend-dot gpu-temp-dot"></span>GPU peak {gpuPeak ? `${axisValue(gpuPeak.v)}°C` : '—'}</span>
+            <span><span class="legend-dot cpu-temp-dot"></span>CPU peak {cpuPeak ? `${axisValue(cpuPeak.v)}°C` : '—'}</span>
+            <span><span class="legend-dot fan-on-dot"></span>Fan on</span>
+            <span><span class="legend-dot fan-off-dot"></span>Fan off</span>
           </div>
         </div>
       </div>
@@ -617,10 +840,10 @@
         <div class="range-toggle" role="group" aria-label="Chart time range">
           {#each CHART_RANGES as r}
             <button
-              class="range-btn {chartRangeH === r ? 'active' : ''}"
-              aria-pressed={chartRangeH === r}
-              onclick={() => (chartRangeH = r)}
-            >{r}h</button>
+              class="range-btn {chartRangeH === r.value ? 'active' : ''}"
+              aria-pressed={chartRangeH === r.value}
+              onclick={() => (chartRangeH = r.value)}
+            >{r.label}</button>
           {/each}
         </div>
       </div>
@@ -631,7 +854,7 @@
       <div class="card events-card">
         <div class="section-header">
           <h2>Events</h2>
-          <span class="section-sub">boot · crash · throttling</span>
+          <span class="section-sub">boot · crash · throttling · fan</span>
         </div>
         <div class="events-list">
           {#each [...metrics.events].reverse().slice(0, 8) as ev}
@@ -848,11 +1071,32 @@
         <div class="card models-card">
           <div class="section-header">
             <h2>ComfyUI</h2>
-            {#if metrics.inference.comfyui?.running}
-              <span class="engine-pill running">:{metrics.inference.comfyui.port}</span>
-            {:else}
-              <span class="engine-pill stopped">Stopped</span>
-            {/if}
+            <div class="engine-actions">
+              {#if metrics.inference.comfyui?.pending === 'start'}
+                <span class="engine-pill loading">Starting</span>
+              {:else if metrics.inference.comfyui?.pending === 'stop'}
+                <span class="engine-pill loading">Stopping</span>
+              {:else if metrics.inference.comfyui?.running}
+                <span class="engine-pill running">:{metrics.inference.comfyui.port}</span>
+              {:else}
+                <span class="engine-pill stopped">Stopped</span>
+              {/if}
+              {#if metrics.inference.comfyui?.running || metrics.inference.comfyui?.pending === 'stop'}
+                <button
+                  type="button"
+                  class="engine-btn stop"
+                  disabled={comfyBusy || metrics.inference.comfyui?.pending === 'stop'}
+                  onclick={() => controlComfy('stop')}
+                >Stop</button>
+              {:else}
+                <button
+                  type="button"
+                  class="engine-btn start"
+                  disabled={comfyBusy || metrics.inference.comfyui?.pending === 'start'}
+                  onclick={() => controlComfy('start')}
+                >Start</button>
+              {/if}
+            </div>
           </div>
           {#if metrics.inference.health?.comfyui}
             <div class="engine-health {metrics.inference.health.comfyui.online ? 'online' : 'offline'}">
@@ -872,8 +1116,13 @@
                   <span class="model-params">PID {metrics.inference.comfyui.pid}</span>
                 </div>
               </div>
+            {:else if metrics.inference.comfyui?.pending === 'start'}
+              <div class="model-empty">Starting on :{metrics.inference.comfyui.port}…</div>
             {:else}
               <div class="model-empty">Not running</div>
+            {/if}
+            {#if metrics.inference.comfyui?.error}
+              <div class="model-empty comfy-error">{metrics.inference.comfyui.error}</div>
             {/if}
           </div>
         </div>
@@ -885,8 +1134,16 @@
     </div>
   {:else}
     <div class="loading-state">
-      <div class="loading-spinner"></div>
-      <div class="loading-text">Loading system metrics...</div>
+      <div class="skeleton-grid" aria-hidden="true">
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+      </div>
+      <div class="loading-status">
+        <div class="loading-spinner"></div>
+        <div class="loading-text">Loading system metrics…</div>
+      </div>
     </div>
   {/if}
 </div>
@@ -1462,6 +1719,47 @@
     border: 1px solid rgba(255, 69, 58, 0.2);
   }
 
+  .engine-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.45rem;
+  }
+
+  .engine-btn {
+    appearance: none;
+    border: 1px solid var(--border-subtle);
+    background: var(--bg-subtle);
+    color: var(--text-secondary);
+    font: inherit;
+    font-size: 0.75rem;
+    font-weight: 650;
+    letter-spacing: 0.03em;
+    padding: 0.22rem 0.65rem;
+    border-radius: 999px;
+    cursor: pointer;
+  }
+
+  .engine-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  .engine-btn.start {
+    color: #30d158;
+    border-color: rgba(48, 209, 88, 0.28);
+    background: rgba(48, 209, 88, 0.1);
+  }
+
+  .engine-btn.stop {
+    color: #ff453a;
+    border-color: rgba(255, 69, 58, 0.28);
+    background: rgba(255, 69, 58, 0.1);
+  }
+
+  .comfy-error {
+    color: #ff453a !important;
+  }
+
   /* Engine availability line */
   .engine-health {
     display: flex;
@@ -1542,6 +1840,48 @@
   /* Benign clock/power states (e.g. SW Power Cap on GB10) */
   .throttle-info {
     color: var(--text-secondary);
+  }
+
+  .fan-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.45rem 0.65rem;
+    margin-top: 0.35rem;
+  }
+
+  .fan-label {
+    color: var(--text-secondary);
+    font-size: 0.78rem;
+  }
+
+  .fan-modes {
+    display: inline-flex;
+    gap: 2px;
+    padding: 2px;
+    border-radius: 8px;
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-subtle);
+  }
+
+  .fan-mode {
+    appearance: none;
+    border: 0;
+    background: transparent;
+    color: var(--text-tertiary);
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 650;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 0.18rem 0.45rem;
+    border-radius: 6px;
+    cursor: pointer;
+  }
+
+  .fan-mode.active {
+    background: rgba(100, 210, 255, 0.16);
+    color: #64d2ff;
   }
 
   .models-list {
@@ -1835,6 +2175,30 @@
 
   .legend-dot.gpu-temp-dot { background: #ff9f0a; }
   .legend-dot.cpu-temp-dot { background: #0a84ff; }
+  .legend-dot.fan-on-dot { background: #64d2ff; }
+  .legend-dot.fan-off-dot { background: #636366; }
+
+  .fan-band-on { fill: rgba(100, 210, 255, 0.16); }
+  .fan-band-off { fill: rgba(99, 99, 102, 0.06); }
+  .fan-strip-on { fill: #64d2ff; }
+  .fan-strip-off { fill: #636366; }
+  .fan-threshold-on {
+    stroke: #64d2ff;
+    stroke-width: 0.8;
+    stroke-dasharray: 5 4;
+    opacity: 0.55;
+  }
+  .fan-threshold-off {
+    stroke: #8e8e93;
+    stroke-width: 0.8;
+    stroke-dasharray: 4 5;
+    opacity: 0.4;
+  }
+
+  :global([data-theme='light']) .fan-band-on { fill: rgba(0, 122, 255, 0.12); }
+  :global([data-theme='light']) .fan-band-off { fill: rgba(60, 60, 67, 0.05); }
+  :global([data-theme='light']) .fan-strip-on { fill: #007aff; }
+  :global([data-theme='light']) .legend-dot.fan-on-dot { background: #007aff; }
 
   /* Events */
   .events-card {
@@ -1874,6 +2238,11 @@
   .event-dot.unclean_shutdown { background: #ff453a; }
   .event-dot.throttle_start { background: #ff9f0a; }
   .event-dot.throttle_end { background: #30d158; }
+  .event-dot.fan_on { background: #64d2ff; }
+  .event-dot.fan_off { background: #8e8e93; }
+  .event-dot.fan_error { background: #ff453a; }
+  .event-dot.comfy_start { background: #30d158; }
+  .event-dot.comfy_stop { background: #ff9f0a; }
 
   .event-time {
     color: var(--text-tertiary);
@@ -1963,6 +2332,371 @@
     .process-row {
       grid-template-columns: 1.5fr 0.8fr 0.8fr 0.6fr;
       font-size: 0.85rem;
+    }
+  }
+
+  /* ── 2026 visual refresh: deep-space glass, refined type, micro-motion ── */
+
+  .dashboard {
+    max-width: 1680px;
+    padding: clamp(1.25rem, 3vw, 2.5rem);
+  }
+
+  .dashboard > * {
+    animation: fade-rise 0.5s var(--ease-spring) both;
+  }
+
+  .dashboard > *:nth-child(2) { animation-delay: 0.05s; }
+  .dashboard > *:nth-child(3) { animation-delay: 0.1s; }
+  .dashboard > *:nth-child(4) { animation-delay: 0.15s; }
+  .dashboard > *:nth-child(5) { animation-delay: 0.2s; }
+  .dashboard > *:nth-child(6) { animation-delay: 0.25s; }
+  .dashboard > *:nth-child(7) { animation-delay: 0.3s; }
+  .dashboard > *:nth-child(8) { animation-delay: 0.35s; }
+
+  .header {
+    align-items: center;
+    margin-bottom: 1.75rem;
+    padding-bottom: 1.25rem;
+  }
+
+  .header-title {
+    display: flex;
+    align-items: center;
+    gap: 0.85rem;
+  }
+
+  .header-title::before {
+    content: '';
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: conic-gradient(from 180deg, #0a84ff, #bf5af2, #ff9f0a, #0a84ff);
+    box-shadow: 0 0 18px rgba(10, 132, 255, 0.65);
+  }
+
+  .header-title h1 {
+    font-size: clamp(1.7rem, 3vw, 2.2rem);
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+  }
+
+  .system-meta {
+    gap: 0.55rem;
+    margin-top: 0.3rem;
+    font-size: 0.9rem;
+  }
+
+  .hostname {
+    font-weight: 600;
+    letter-spacing: 0.01em;
+  }
+
+  .theme-toggle {
+    width: 38px;
+    height: 38px;
+    border-radius: 12px;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  .theme-toggle:hover {
+    transform: scale(1.06) rotate(8deg);
+  }
+
+  .uptime-pill,
+  .status-pill {
+    padding: 0.42rem 0.9rem;
+    font-size: 0.85rem;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.05);
+  }
+
+  .status-dot {
+    width: 7px;
+    height: 7px;
+    animation: pulse-dot 2.2s ease-out infinite;
+  }
+
+  .status-pill.disconnected .status-dot {
+    animation: none;
+  }
+
+  @keyframes pulse-dot {
+    0% { box-shadow: 0 0 0 0 rgba(48, 209, 88, 0.45); }
+    70% { box-shadow: 0 0 0 6px rgba(48, 209, 88, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(48, 209, 88, 0); }
+  }
+
+  .card {
+    position: relative;
+    padding: 1.25rem;
+    border-radius: var(--radius-md);
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    backdrop-filter: blur(28px) saturate(170%);
+    -webkit-backdrop-filter: blur(28px) saturate(170%);
+    box-shadow: var(--shadow-sm), inset 0 1px 0 rgba(255, 255, 255, 0.045);
+    transition: transform var(--transition-normal), background var(--transition-normal),
+      border-color var(--transition-normal), box-shadow var(--transition-normal);
+    overflow: hidden;
+  }
+
+  .card::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    background: radial-gradient(120% 65% at 50% 0%, rgba(255, 255, 255, 0.05), transparent 55%);
+    pointer-events: none;
+  }
+
+  .card:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--border-color-hover);
+    transform: translateY(-2px);
+    box-shadow: var(--shadow-md), inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  }
+
+  .stats-grid,
+  .charts-grid,
+  .models-grid {
+    gap: 1.1rem;
+    margin-bottom: 1.1rem;
+  }
+
+  .processes-card,
+  .events-card {
+    margin-bottom: 1.1rem;
+  }
+
+  .stat-header h2 {
+    font-size: 0.76rem;
+    font-weight: 650;
+    letter-spacing: 0.1em;
+    color: var(--text-tertiary);
+  }
+
+  .stat-badge {
+    background: var(--bg-subtle);
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-pill);
+    padding: 0.18rem 0.62rem;
+    font-size: 0.82rem;
+    font-weight: 650;
+  }
+
+  .stat-main {
+    font-size: 1.02rem;
+    font-weight: 650;
+    letter-spacing: -0.01em;
+  }
+
+  .gauge-wrap svg {
+    filter: drop-shadow(0 0 10px rgba(255, 255, 255, 0.08));
+  }
+
+  .core-bar-wrap {
+    border-radius: 3px;
+  }
+
+  .core-bar {
+    border-radius: 3px;
+    background: linear-gradient(180deg, #3ce061, #28b04c);
+  }
+
+  .mem-total {
+    font-size: 1.75rem;
+    letter-spacing: -0.03em;
+  }
+
+  .mem-bar {
+    height: 10px;
+  }
+
+  .mem-bar-gpu { background: linear-gradient(90deg, #ff9f0a, #ffc260); }
+  .mem-bar-os { background: linear-gradient(90deg, #0a84ff, #55aaff); }
+  .mem-bar-disk { background: linear-gradient(90deg, #bf5af2, #df9fff); }
+
+  .chart-container {
+    height: 138px;
+  }
+
+  .chart-current {
+    font-size: 1.35rem;
+    letter-spacing: -0.025em;
+  }
+
+  .chart-labels {
+    font-size: 0.78rem;
+    color: var(--text-secondary);
+  }
+
+  .chart-ticks {
+    font-size: 0.72rem;
+  }
+
+  .chart-plot {
+    position: relative;
+    padding-left: 42px;
+    margin-top: 0.5rem;
+  }
+
+  .chart-plot .chart-container {
+    margin-top: 0;
+  }
+
+  .chart-y-axis {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 42px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    align-items: flex-end;
+    padding-right: 8px;
+    font-size: 0.66rem;
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    pointer-events: none;
+    user-select: none;
+  }
+
+  .chart-controls {
+    margin: 0.15rem 0 1.1rem;
+  }
+
+  .range-toggle {
+    padding: 4px;
+    box-shadow: var(--shadow-sm);
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+  }
+
+  .range-btn {
+    padding: 0.4rem 1.15rem;
+    font-size: 0.78rem;
+    letter-spacing: 0.02em;
+  }
+
+  .range-btn:hover {
+    background: var(--bg-subtle-hover);
+  }
+
+  .range-btn.active {
+    background: linear-gradient(180deg, #2997ff, #0a84ff);
+    box-shadow: 0 2px 10px rgba(10, 132, 255, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+
+  .engine-pill {
+    font-size: 0.78rem;
+    font-weight: 650;
+    padding: 0.24rem 0.65rem;
+  }
+
+  .running-badge,
+  .comfyui-badge {
+    border-radius: var(--radius-pill);
+    padding: 0.16rem 0.55rem;
+  }
+
+  .processes-head {
+    font-size: 0.72rem;
+    letter-spacing: 0.08em;
+  }
+
+  .process-row.comfyui-row {
+    background: rgba(48, 209, 88, 0.055);
+    border-left: 2px solid #32d74b;
+  }
+
+  .model-item {
+    border-radius: 12px;
+    padding: 0.7rem 0.8rem;
+    transition: transform var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .model-item:hover {
+    transform: translateY(-1px);
+  }
+
+  .model-name {
+    font-weight: 620;
+  }
+
+  .event-dot {
+    width: 8px;
+    height: 8px;
+  }
+
+  .event-dot.boot { box-shadow: 0 0 8px rgba(10, 132, 255, 0.5); }
+  .event-dot.unclean_shutdown { box-shadow: 0 0 8px rgba(255, 69, 58, 0.5); }
+  .event-dot.throttle_start { box-shadow: 0 0 8px rgba(255, 159, 10, 0.5); }
+  .event-dot.throttle_end { box-shadow: 0 0 8px rgba(48, 209, 88, 0.5); }
+  .event-dot.fan_on { box-shadow: 0 0 8px rgba(100, 210, 255, 0.45); }
+  .event-dot.fan_error { box-shadow: 0 0 8px rgba(255, 69, 58, 0.5); }
+  .event-dot.comfy_start { box-shadow: 0 0 8px rgba(48, 209, 88, 0.5); }
+  .event-dot.comfy_stop { box-shadow: 0 0 8px rgba(255, 159, 10, 0.5); }
+
+  .footer {
+    font-size: 0.8rem;
+    letter-spacing: 0.01em;
+  }
+
+  /* Loading skeleton */
+  .loading-state {
+    min-height: 60vh;
+    gap: 1.6rem;
+  }
+
+  .skeleton-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(180px, 1fr));
+    gap: 1.1rem;
+    width: min(100%, 1680px);
+    padding: 0 clamp(1.25rem, 3vw, 2.5rem);
+  }
+
+  .skeleton-card {
+    height: 190px;
+    border-radius: var(--radius-md);
+    background: linear-gradient(100deg, var(--bg-subtle) 40%, var(--bg-subtle-hover) 50%, var(--bg-subtle) 60%);
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+  }
+
+  @keyframes shimmer {
+    to { background-position: -200% 0; }
+  }
+
+  .loading-status {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .loading-spinner {
+    width: 26px;
+    height: 26px;
+    border-width: 2.5px;
+  }
+
+  .loading-text {
+    font-size: 0.95rem;
+    letter-spacing: 0.01em;
+  }
+
+  @media (max-width: 1024px) {
+    .skeleton-grid {
+      grid-template-columns: repeat(2, 1fr);
+    }
+  }
+
+  @media (max-width: 640px) {
+    .skeleton-grid {
+      grid-template-columns: 1fr;
     }
   }
 </style>

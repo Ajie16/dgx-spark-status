@@ -1,16 +1,17 @@
 import { createServer } from 'vite';
 import si from 'systeminformation';
 import express from 'express';
-import { exec } from 'child_process';
+import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
-import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync } from 'fs';
+import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync, openSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { homedir } from 'os';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 const execAsync = promisify(exec);
-const UPDATE_INTERVAL = 1000;
+const UPDATE_INTERVAL = 5000; // refresh cadence for sampling + SSE broadcast
 const LLAMA_SERVER = 'http://127.0.0.1:8001';
 
 // Model notes — user-editable, stored in JSON file
@@ -28,12 +29,12 @@ function saveNotes(notes) {
 }
 
 // ── Metrics history (7 days, append-only JSONL) ───────────────────────
-// 1-second samples kept in memory for 10 minutes (raw, not persisted),
+// 5-second samples kept in memory for 10 minutes (raw, not persisted),
 // then downsampled to 1-minute averages appended one line at a time to
 // metrics-history.jsonl (~150 KB/day of writes). File is trimmed to
 // AGG_MAX lines at startup and compacted periodically.
 const HISTORY_FILE = join(__dirname, 'metrics-history.jsonl');
-const RAW_MAX_AGE = 10 * 60 * 1000; // 10 min of 1s points
+const RAW_MAX_AGE = 10 * 60 * 1000; // 10 min of 5s points
 const AGG_MAX = 7 * 24 * 60;        // 7 days of 1-min points
 
 let historyRaw = [];
@@ -86,7 +87,8 @@ function recordHistory(m) {
     gpuTemp: m.gpu?.[0]?.temperatureGpu ?? null,
     cpuTemp: m.cpu?.temperature ?? null,
     gpuPower: m.gpu?.[0]?.powerDraw ?? null,
-    mem: m.memory?.usagePercent ?? 0
+    mem: m.memory?.usagePercent ?? 0,
+    fan: fan.actual === 'on' ? 1 : fan.actual === 'off' ? 0 : null
   };
   historyRaw.push(point);
   const cutoff = m.timestamp - RAW_MAX_AGE;
@@ -101,11 +103,18 @@ function recordHistory(m) {
           ? parseFloat((minuteBucket.sums[k].sum / minuteBucket.sums[k].n).toFixed(2))
           : null;
       }
+      agg.fan = minuteBucket.fanSeen ? (minuteBucket.fanOn ? 1 : 0) : null;
       historyAgg.push(agg);
       if (historyAgg.length > AGG_MAX) historyAgg = historyAgg.slice(-AGG_MAX);
       appendAggPoint(agg);
     }
-    minuteBucket = { minute, n: 0, sums: Object.fromEntries(HISTORY_KEYS.map(k => [k, { sum: 0, n: 0 }])) };
+    minuteBucket = {
+      minute,
+      n: 0,
+      sums: Object.fromEntries(HISTORY_KEYS.map(k => [k, { sum: 0, n: 0 }])),
+      fanOn: false,
+      fanSeen: false
+    };
   }
   minuteBucket.n++;
   for (const k of HISTORY_KEYS) {
@@ -114,6 +123,8 @@ function recordHistory(m) {
       minuteBucket.sums[k].n++;
     }
   }
+  if (point.fan === 1) { minuteBucket.fanOn = true; minuteBucket.fanSeen = true; }
+  else if (point.fan === 0) minuteBucket.fanSeen = true;
 }
 
 // ── Service availability tracking ─────────────────────────────────────
@@ -275,6 +286,222 @@ function stabilizeThrottleDisplay(m) {
   }
   tr.warnings = heldThrottleWarnings;
   tr.info = heldThrottleInfo;
+}
+
+// ── Room fan (米家 mesh 通断器 via ha-mijia) ─────────────────────────
+// The bedroom 散热风扇 is a binary wall switch, not a PWM chassis fan.
+// Drive it from the same always-on tick as the rest of the dashboard:
+// Observed on this Spark (7d history): idle GPU ~38°C / 9W, load ~76°C / 74W.
+//   ON  if GPU>=65 / CPU>=70 / NVMe>=70 / GPU power>=28W / thermal warning
+//   OFF if GPU<=52 AND CPU<=62 AND NVMe<=58 AND no thermal warning
+//   hold current state in the dead band. Missing GPU temp never turns the
+//   fan off (fail-safe). Confirm 3 ticks (~15s) before flipping; thermal
+//   warning forces ON immediately. Min ON 5 min / min OFF 3 min so the
+//   relay is not worn out. Startup reads HA and does not flip until dwell
+//   elapses. Mode auto|on|off is persisted; FAN_CONTROL=0 disables.
+const HA_PY = join(homedir(), '.grok/skills/ha-mijia/scripts/ha.py');
+const FAN_NAME = '散热风扇';
+const FAN_STATE_FILE = join(__dirname, 'fan-control.json');
+const FAN_ON = { gpu: 65, cpu: 70, nvme: 70, power: 28 };
+const FAN_OFF = { gpu: 52, cpu: 62, nvme: 58 };
+const FAN_MIN_ON_MS = 5 * 60 * 1000;
+const FAN_MIN_OFF_MS = 3 * 60 * 1000;
+const FAN_CONFIRM_TICKS = 3;
+const FAN_RETRY_MS = 30 * 1000;
+
+function loadFanMode() {
+  try {
+    if (existsSync(FAN_STATE_FILE)) {
+      const m = JSON.parse(readFileSync(FAN_STATE_FILE, 'utf8')).mode;
+      if (m === 'auto' || m === 'on' || m === 'off') return m;
+    }
+  } catch (e) {}
+  return 'auto';
+}
+
+function saveFanMode(mode) {
+  try { writeFileSync(FAN_STATE_FILE, JSON.stringify({ mode, t: Date.now() })); } catch (e) {}
+}
+
+const fan = {
+  enabled: process.env.FAN_CONTROL !== '0',
+  mode: loadFanMode(),
+  actual: null,       // 'on' | 'off' | 'unavailable' | null
+  desired: null,
+  lastChange: 0,
+  lastError: null,
+  lastCall: 0,
+  pending: null,      // 'on' | 'off' while confirming
+  pendingTicks: 0,
+  busy: false,
+  reason: 'init'
+};
+
+function parseHaSwitch(stdout) {
+  const line = (stdout || '').split('\n').map(s => s.trim()).find(s => /^(on|off)\b/.test(s));
+  return line ? line.split(/\s+/, 1)[0] : null;
+}
+
+function haFan(action) {
+  const args = action === 'state' ? ['state', FAN_NAME] : [action, FAN_NAME];
+  return new Promise((resolve, reject) => {
+    execFile('python3', [HA_PY, ...args], { timeout: 12000 }, (err, stdout, stderr) => {
+      if (err) {
+        const msg = (stderr || err.message || '').trim().slice(0, 240);
+        reject(new Error(msg || `ha.py ${action} failed`));
+        return;
+      }
+      resolve(parseHaSwitch(stdout));
+    });
+  });
+}
+
+function fanSnapshot() {
+  return {
+    enabled: fan.enabled,
+    mode: fan.mode,
+    state: fan.actual,
+    desired: fan.desired,
+    reason: fan.reason,
+    lastChange: fan.lastChange || null,
+    lastError: fan.lastError,
+    thresholds: { on: FAN_ON, off: FAN_OFF }
+  };
+}
+
+function evaluateFanWant(m) {
+  const gpu = m.gpu?.[0]?.temperatureGpu;
+  const cpu = m.cpu?.temperature;
+  const nvme = m.diskIO?.temp;
+  const power = m.gpu?.[0]?.powerDraw;
+  const thermal = !!(m.gpu?.[0]?.throttleReasons?.warnings?.length);
+  const above = (v, lim) => v != null && v >= lim;
+  const hold = fan.actual === 'on' ? 'on' : 'off';
+
+  if (thermal || above(gpu, FAN_ON.gpu) || above(cpu, FAN_ON.cpu) || above(nvme, FAN_ON.nvme) || above(power, FAN_ON.power)) {
+    const bits = [];
+    if (thermal) bits.push('thermal');
+    if (above(gpu, FAN_ON.gpu)) bits.push(`gpu ${gpu}°C`);
+    if (above(cpu, FAN_ON.cpu)) bits.push(`cpu ${cpu}°C`);
+    if (above(nvme, FAN_ON.nvme)) bits.push(`nvme ${nvme}°C`);
+    if (above(power, FAN_ON.power)) bits.push(`${power}W`);
+    return { want: 'on', reason: bits.join(' · '), force: thermal };
+  }
+  // Don't treat a missing GPU reading as "cool" — keep the last state.
+  if (gpu == null) return { want: hold, reason: 'no gpu temp' };
+  const cool = gpu <= FAN_OFF.gpu
+    && (cpu == null || cpu <= FAN_OFF.cpu)
+    && (nvme == null || nvme <= FAN_OFF.nvme)
+    && !thermal;
+  if (cool) {
+    const bits = [`gpu ${gpu}°C`];
+    if (cpu != null) bits.push(`cpu ${cpu}°C`);
+    if (nvme != null) bits.push(`nvme ${nvme}°C`);
+    return { want: 'off', reason: bits.join(' · ') };
+  }
+  return { want: hold, reason: 'hysteresis' };
+}
+
+async function applyFanAction(action, reason) {
+  if (fan.busy) return;
+  fan.busy = true;
+  try {
+    const state = await haFan(action);
+    fan.actual = state || action;
+    fan.desired = action;
+    fan.lastChange = Date.now();
+    fan.lastError = null;
+    fan.reason = reason;
+    fan.pending = null;
+    fan.pendingTicks = 0;
+    addEvent(action === 'on' ? 'fan_on' : 'fan_off', { reason, state: fan.actual });
+  } catch (e) {
+    fan.lastError = e.message;
+    fan.lastCall = Date.now();
+    addEvent('fan_error', { action, error: e.message });
+  } finally {
+    fan.busy = false;
+  }
+}
+
+async function applyFanControl(m) {
+  if (!fan.enabled) {
+    fan.reason = 'disabled';
+    return;
+  }
+  const now = Date.now();
+  if (fan.lastError && now - fan.lastCall < FAN_RETRY_MS) return;
+
+  if (fan.actual == null) {
+    try {
+      fan.actual = await haFan('state');
+      fan.lastChange = now;
+      fan.lastError = null;
+      fan.reason = `ha ${fan.actual}`;
+    } catch (e) {
+      fan.actual = 'unavailable';
+      fan.lastError = e.message;
+      fan.lastCall = now;
+      addEvent('fan_error', { action: 'state', error: e.message });
+    }
+    return;
+  }
+  if (fan.actual === 'unavailable') {
+    fan.reason = 'unavailable';
+    return;
+  }
+
+  let want, reason, force = false;
+  if (fan.mode === 'on' || fan.mode === 'off') {
+    want = fan.mode;
+    reason = `manual ${fan.mode}`;
+    force = true;
+  } else {
+    const ev = evaluateFanWant(m);
+    want = ev.want;
+    reason = ev.reason;
+    force = ev.force;
+  }
+  fan.desired = want;
+  if (want === fan.actual) {
+    fan.pending = null;
+    fan.pendingTicks = 0;
+    if (fan.reason === 'init' || fan.reason === 'hysteresis' || fan.reason.startsWith('ha ')) fan.reason = reason;
+    return;
+  }
+
+  const dwell = fan.actual === 'on' ? FAN_MIN_ON_MS : FAN_MIN_OFF_MS;
+  if (!force && fan.lastChange && now - fan.lastChange < dwell) {
+    fan.reason = `dwell ${Math.ceil((dwell - (now - fan.lastChange)) / 1000)}s`;
+    return;
+  }
+  if (!force) {
+    if (fan.pending !== want) {
+      fan.pending = want;
+      fan.pendingTicks = 1;
+      fan.reason = `confirm ${want}`;
+      return;
+    }
+    fan.pendingTicks += 1;
+    if (fan.pendingTicks < FAN_CONFIRM_TICKS) {
+      fan.reason = `confirm ${want} ${fan.pendingTicks}/${FAN_CONFIRM_TICKS}`;
+      return;
+    }
+  }
+  await applyFanAction(want, reason);
+}
+
+async function setFanMode(mode) {
+  if (mode !== 'auto' && mode !== 'on' && mode !== 'off') {
+    throw new Error('mode must be auto|on|off');
+  }
+  fan.mode = mode;
+  saveFanMode(mode);
+  fan.pending = null;
+  fan.pendingTicks = 0;
+  if (mode === 'on' || mode === 'off') {
+    await applyFanAction(mode, `manual ${mode}`);
+  }
 }
 
 let lastHealthJson = JSON.stringify(serviceHealth);
@@ -837,15 +1064,38 @@ async function getNvidiaGPUInfo() {
 }
 
 // Get ComfyUI info by checking port 8188
+const COMFY_DIR = process.env.COMFYUI_DIR || join(homedir(), 'workspace/ComfyUI');
+const COMFY_PY = process.env.COMFYUI_PYTHON || join(COMFY_DIR, '.venv/bin/python');
+const COMFY_PORT = 8188;
+const COMFY_LOG = join(COMFY_DIR, 'user', 'comfyui-dashboard.log');
+
+const comfyCtl = { action: null, error: null, since: 0, pid: null };
+
+async function comfyListenPids() {
+  try {
+    const { stdout } = await execAsync('lsof -Pi :8188 -sTCP:LISTEN -t 2>/dev/null || true');
+    return stdout.trim().split(/\s+/).map(n => parseInt(n, 10)).filter(n => n > 0);
+  } catch (e) {
+    return [];
+  }
+}
+
+function withComfyControl(info) {
+  const age = Date.now() - (comfyCtl.since || 0);
+  let pending = comfyCtl.action;
+  if (pending === 'start' && info.running) pending = null;
+  if (pending === 'stop' && !info.running) pending = null;
+  if (pending && age > 90 * 1000) pending = null;
+  comfyCtl.action = pending;
+  return { ...info, pending, error: comfyCtl.error };
+}
+
 async function getComfyUIInfo() {
   try {
-    const { stdout } = await execAsync(
-      `lsof -Pi :8188 -sTCP:LISTEN -t 2>/dev/null || ss -tlnp 2>/dev/null | grep ':8188' | grep -oP '(?<=pid=)\\d+' | head -1`
-    );
-    const pid = stdout.trim();
-    if (!pid) return { running: false, port: 8188 };
+    const pids = await comfyListenPids();
+    const pid = pids[0];
+    if (!pid) return withComfyControl({ running: false, port: COMFY_PORT });
 
-    // Get process details
     const { stdout: psOut } = await execAsync(
       `ps -p ${pid} -o pid,user,%cpu,%mem,rss,command --no-headers 2>/dev/null`
     );
@@ -853,19 +1103,82 @@ async function getComfyUIInfo() {
     const rss = parseInt(parts[4]) || 0;
     const command = parts.slice(5).join(' ') || '';
 
-    return {
+    return withComfyControl({
       running: true,
-      port: 8188,
-      pid: parseInt(parts[0]) || parseInt(pid),
+      port: COMFY_PORT,
+      pid: parseInt(parts[0]) || pid,
       user: parts[1] || '',
       cpu: parseFloat(parts[2]) || 0,
       mem: parseFloat(parts[3]) || 0,
       memoryGB: (rss / 1024 / 1024).toFixed(2),
       command: command.length > 80 ? command.substring(0, 77) + '...' : command
-    };
+    });
   } catch (error) {
-    return { running: false, port: 8188 };
+    return withComfyControl({ running: false, port: COMFY_PORT });
   }
+}
+
+async function startComfyUI() {
+  const pids = await comfyListenPids();
+  if (pids.length) {
+    comfyCtl.action = null;
+    comfyCtl.error = null;
+    return getComfyUIInfo();
+  }
+  if (!existsSync(COMFY_PY)) throw new Error(`ComfyUI python not found: ${COMFY_PY}`);
+  if (!existsSync(join(COMFY_DIR, 'main.py'))) throw new Error(`ComfyUI main.py not found in ${COMFY_DIR}`);
+
+  comfyCtl.action = 'start';
+  comfyCtl.error = null;
+  comfyCtl.since = Date.now();
+
+  const out = openSync(COMFY_LOG, 'a');
+  const child = spawn(COMFY_PY, ['-u', 'main.py', '--listen', '0.0.0.0', '--port', String(COMFY_PORT)], {
+    cwd: COMFY_DIR,
+    detached: true,
+    stdio: ['ignore', out, out],
+    env: { ...process.env, VIRTUAL_ENV: join(COMFY_DIR, '.venv') }
+  });
+  comfyCtl.pid = child.pid;
+  child.on('error', (err) => {
+    comfyCtl.error = err.message;
+    comfyCtl.action = null;
+  });
+  child.on('exit', (code, signal) => {
+    if (comfyCtl.action === 'start' && code) {
+      comfyCtl.error = `ComfyUI exited ${code}${signal ? ` (${signal})` : ''}`;
+      comfyCtl.action = null;
+    }
+  });
+  child.unref();
+  addEvent('comfy_start', { pid: child.pid });
+  return withComfyControl({ running: false, port: COMFY_PORT, pid: child.pid });
+}
+
+async function stopComfyUI() {
+  const pids = await comfyListenPids();
+  const targets = new Set(pids);
+  if (comfyCtl.pid) targets.add(comfyCtl.pid);
+  if (!targets.size) {
+    comfyCtl.action = null;
+    comfyCtl.error = null;
+    return withComfyControl({ running: false, port: COMFY_PORT });
+  }
+  comfyCtl.action = 'stop';
+  comfyCtl.error = null;
+  comfyCtl.since = Date.now();
+  for (const pid of targets) {
+    try { process.kill(pid, 'SIGTERM'); } catch (e) {}
+  }
+  addEvent('comfy_stop', { pids: [...targets] });
+  setTimeout(() => {
+    comfyListenPids().then(left => {
+      for (const pid of left) {
+        try { process.kill(pid, 'SIGKILL'); } catch (e) {}
+      }
+    }).catch(() => {});
+  }, 8000);
+  return withComfyControl({ running: true, port: COMFY_PORT, pid: pids[0] || null });
 }
 
 // Collect system metrics
@@ -1049,10 +1362,12 @@ async function tick() {
       if (Date.now() - modelLastScan > MODEL_REFRESH_MS) refreshModelInventory();
       const metrics = await getSystemMetrics();
       if (!metrics) return;
-      recordHistory(metrics);
       updateServiceHealth(metrics);
       trackThrottling(metrics);
       stabilizeThrottleDisplay(metrics);
+      await applyFanControl(metrics);
+      metrics.fan = fanSnapshot();
+      recordHistory(metrics);
       if (metrics.inference) metrics.inference.health = serviceHealth;
       metrics.events = systemEvents.slice(-20);
       metrics.modelNotes = loadNotes();
@@ -1128,6 +1443,34 @@ async function startDevServer() {
     }
     saveNotes(notes);
     res.json({ ok: true, notes });
+  });
+
+  app.get('/api/fan', (_req, res) => {
+    res.json(fanSnapshot());
+  });
+  app.post('/api/fan', async (req, res) => {
+    try {
+      await setFanMode(req.body?.mode);
+      res.json({ ok: true, fan: fanSnapshot() });
+    } catch (e) {
+      res.status(400).json({ error: e.message, fan: fanSnapshot() });
+    }
+  });
+
+  app.get('/api/comfyui', async (_req, res) => {
+    res.json(await getComfyUIInfo());
+  });
+  app.post('/api/comfyui', async (req, res) => {
+    const action = req.body?.action;
+    try {
+      if (action === 'start') return res.json({ ok: true, comfyui: await startComfyUI() });
+      if (action === 'stop') return res.json({ ok: true, comfyui: await stopComfyUI() });
+      res.status(400).json({ error: 'action must be start or stop' });
+    } catch (e) {
+      comfyCtl.error = e.message;
+      comfyCtl.action = null;
+      res.status(500).json({ error: e.message, comfyui: await getComfyUIInfo() });
+    }
   });
 
   // Use Vite middleware
