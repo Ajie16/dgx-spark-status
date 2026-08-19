@@ -3,6 +3,7 @@ import si from 'systeminformation';
 import express from 'express';
 import { exec, execFile, spawn } from 'child_process';
 import { promisify } from 'util';
+import http from 'node:http';
 import { readFileSync, writeFileSync, appendFileSync, existsSync, readdirSync, unlinkSync, openSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -13,6 +14,114 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const execAsync = promisify(exec);
 const UPDATE_INTERVAL = 5000; // refresh cadence for sampling + SSE broadcast
 const LLAMA_SERVER = 'http://127.0.0.1:8001';
+
+// ── Peer nodes (multi-DGX supervision) ────────────────────────────────
+// PEER_NODES="spark-2=http://<peer-ip>:9000,spark-3=http://..." or JSON
+// array [{"name":"spark-2","url":"http://..."}]. Each peer must run this
+// dashboard; the primary pulls /api/snapshot and exposes merged node state.
+function parsePeerNodes(spec) {
+  const peers = [];
+  if (!spec || !String(spec).trim()) return peers;
+  const s = String(spec).trim();
+  try {
+    if (s.startsWith('[')) {
+      for (const p of JSON.parse(s)) {
+        if (p && p.name && p.url) peers.push({ name: String(p.name), url: String(p.url) });
+      }
+      return peers;
+    }
+  } catch (e) {}
+  for (const part of s.split(',')) {
+    const m = part.trim().match(/^([^=]+)=(.+)$/);
+    if (m) peers.push({ name: m[1].trim(), url: m[2].trim() });
+  }
+  return peers;
+}
+
+const PEER_NODES = parsePeerNodes(process.env.PEER_NODES || '');
+const peerState = new Map(); // name -> {name,url,online,lastSeen,error,metrics}
+
+// Snapshot payloads must not carry the `nodes` field, otherwise peer-of-peer
+// data would nest and balloon with every tick.
+function cleanSnapshot(m) {
+  if (!m) return null;
+  const { nodes, ...rest } = m;
+  return rest;
+}
+
+async function refreshPeers() {
+  if (!PEER_NODES.length) return;
+  const results = await Promise.allSettled(PEER_NODES.map(async (p) => {
+    const res = await fetch(`${p.url.replace(/\/+$/, '')}/api/snapshot`, {
+      signal: AbortSignal.timeout(2500)
+    });
+    if (!res.ok) throw new Error(`http ${res.status}`);
+    return cleanSnapshot(await res.json());
+  }));
+  for (let i = 0; i < PEER_NODES.length; i++) {
+    const p = PEER_NODES[i];
+    const r = results[i];
+    const prev = peerState.get(p.name) || { ...p, online: false, lastSeen: null, error: null, metrics: null };
+    if (r.status === 'fulfilled') {
+      peerState.set(p.name, { ...p, online: true, lastSeen: Date.now(), error: null, metrics: r.value });
+    } else {
+      peerState.set(p.name, {
+        ...prev,
+        online: false,
+        error: String(r.reason?.message || r.reason || 'unreachable').slice(0, 120)
+      });
+    }
+  }
+}
+
+// ── Peer reverse proxy ────────────────────────────────────────────────
+// Clients on a third device often cannot route to the cluster's internal
+// peer IPs. Each peer gets a local proxy port (9101, 9102, ...) on this
+// primary, so "open peer dashboard" stays reachable through the primary.
+const PEER_PROXY_BASE_PORT = 9101;
+
+function startPeerProxy() {
+  if (!PEER_NODES.length) return;
+  PEER_NODES.forEach((p, i) => {
+    let target;
+    try {
+      target = new URL(p.url);
+    } catch (e) {
+      console.error(`[proxy] bad peer url for ${p.name}: ${p.url}`);
+      return;
+    }
+    const proxyPort = PEER_PROXY_BASE_PORT + i;
+    p.proxyPort = proxyPort;
+
+    const server = http.createServer((req, res) => {
+      const headers = { ...req.headers, host: target.host };
+      const upstream = http.request({
+        hostname: target.hostname,
+        port: target.port || 80,
+        path: req.url,
+        method: req.method,
+        headers
+      }, (up) => {
+        res.writeHead(up.statusCode || 502, up.headers);
+        up.pipe(res);
+      });
+      upstream.on('error', (err) => {
+        if (!res.headersSent) res.writeHead(502, { 'Content-Type': 'text/plain' });
+        res.end(`proxy error: ${err.message}`);
+      });
+      req.on('error', () => {
+        try { upstream.destroy(); } catch (e) {}
+      });
+      req.pipe(upstream);
+    });
+    server.listen(proxyPort, '0.0.0.0', () => {
+      console.log(`  Peer proxy: http://0.0.0.0:${proxyPort} -> ${p.url} (${p.name})`);
+    });
+    server.on('error', (err) => {
+      console.error(`[proxy] port ${proxyPort} failed: ${err.message}`);
+    });
+  });
+}
 
 // Model notes — user-editable, stored in JSON file
 const NOTES_FILE = join(__dirname, 'model-notes.json');
@@ -1360,7 +1469,7 @@ async function tick() {
   tickPromise = (async () => {
     try {
       if (Date.now() - modelLastScan > MODEL_REFRESH_MS) refreshModelInventory();
-      const metrics = await getSystemMetrics();
+      const [metrics] = await Promise.all([getSystemMetrics(), refreshPeers()]);
       if (!metrics) return;
       updateServiceHealth(metrics);
       trackThrottling(metrics);
@@ -1371,6 +1480,19 @@ async function tick() {
       if (metrics.inference) metrics.inference.health = serviceHealth;
       metrics.events = systemEvents.slice(-20);
       metrics.modelNotes = loadNotes();
+      metrics.nodes = [
+        { name: 'local', host: metrics.system.hostname, online: true, lastSeen: metrics.timestamp, url: null },
+        ...[...peerState.values()].map(p => ({
+          name: p.name,
+          host: p.metrics?.system?.hostname ?? null,
+          online: p.online,
+          lastSeen: p.lastSeen,
+          error: p.error ?? null,
+          url: p.url,
+          proxyPort: p.proxyPort ?? null,
+          metrics: p.metrics
+        }))
+      ];
       latestMetrics = metrics;
 
       if (sseClients.size === 0) return;
@@ -1420,11 +1542,33 @@ async function startDevServer() {
   // Metrics history window (1-min aggregates + last 10 min of 1s samples).
   // Defaults to 24h — the largest chart range the UI can select — but any
   // window up to the 7-day retention cap can be requested with ?hours=N.
-  app.get('/api/history', (req, res) => {
+  app.get('/api/history', async (req, res) => {
     const hours = Math.min(7 * 24, Math.max(1, parseInt(req.query.hours, 10) || 24));
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const node = req.query.node ? String(req.query.node) : null;
+    if (node && node !== 'local' && peerState.has(node)) {
+      const p = peerState.get(node);
+      try {
+        const up = await fetch(`${p.url.replace(/\/+$/, '')}/api/history?hours=${hours}`, {
+          signal: AbortSignal.timeout(6000)
+        });
+        if (up.ok) {
+          res.setHeader('Cache-Control', 'no-store');
+          return res.json(await up.json());
+        }
+      } catch (e) {}
+      return res.status(502).json({ agg: [], raw: [], error: `${node} unavailable` });
+    }
     const cutoff = Date.now() - hours * 60 * 60 * 1000;
     const agg = historyAgg.filter(p => p.t >= cutoff);
     res.json({ agg, raw: historyRaw });
+  });
+
+  // Latest metrics as plain JSON (no SSE) — used by peer nodes for aggregation.
+  app.get('/api/snapshot', (_req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(cleanSnapshot(latestMetrics) ?? { timestamp: Date.now(), system: null });
   });
 
   // Model notes API
@@ -1475,6 +1619,8 @@ async function startDevServer() {
 
   // Use Vite middleware
   app.use(vite.middlewares);
+
+  startPeerProxy();
 
   // Start server
   const server = app.listen(9000, '0.0.0.0', () => {

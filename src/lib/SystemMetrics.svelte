@@ -3,8 +3,12 @@
   import { subscribe, getCurrentMetrics, isWebSocketConnected } from './websocket.js';
   import Gauge from './Gauge.svelte';
 
-  let metrics = $state(null);
+  let localMetrics = $state(null);
+  let peerMetrics = $state({});   // peer name -> latest snapshot metrics
+  let activeNode = $state('local');
+  let metrics = $derived(activeNode === 'local' ? localMetrics : (peerMetrics[activeNode] ?? null));
   let connected = $state(false);
+  let nodes = $state([]);
   let unsubscribe = null;
 
   // Theme
@@ -19,7 +23,7 @@
   let comfyBusy = $state(false);
 
   async function controlComfy(action) {
-    if (comfyBusy) return;
+    if (comfyBusy || activeNode !== 'local') return;
     comfyBusy = true;
     try {
       const res = await fetch('/api/comfyui', {
@@ -28,8 +32,8 @@
         body: JSON.stringify({ action })
       });
       const data = await res.json();
-      if (data.comfyui && metrics?.inference) {
-        metrics.inference.comfyui = { ...metrics.inference.comfyui, ...data.comfyui };
+      if (data.comfyui && localMetrics?.inference) {
+        localMetrics.inference.comfyui = { ...localMetrics.inference.comfyui, ...data.comfyui };
       }
     } catch (e) {
     } finally {
@@ -38,6 +42,7 @@
   }
 
   async function setFanMode(mode) {
+    if (activeNode !== 'local') return;
     try {
       const res = await fetch('/api/fan', {
         method: 'POST',
@@ -45,7 +50,7 @@
         body: JSON.stringify({ mode })
       });
       const data = await res.json();
-      if (data.fan && metrics) metrics.fan = data.fan;
+      if (data.fan && localMetrics) localMetrics.fan = data.fan;
     } catch (e) {}
   }
 
@@ -105,9 +110,12 @@
   }
 
   // Seed charts from server-side history (survives refresh and server restart)
-  async function loadServerHistory() {
+  async function loadServerHistory(node = activeNode) {
     try {
-      const res = await fetch('/api/history?hours=24');
+      const url = node && node !== 'local'
+        ? `/api/history?hours=24&node=${encodeURIComponent(node)}`
+        : '/api/history?hours=24';
+      const res = await fetch(url);
       if (!res.ok) return;
       const data = await res.json();
       chartAgg = (data.agg || [])
@@ -124,6 +132,38 @@
     } catch (e) {
       console.error('Failed to load server history:', e);
     }
+  }
+
+  function selectNode(name) {
+    if (name === activeNode) return;
+    activeNode = name;
+    cpuHistory = Array(HISTORY_LEN).fill(0);
+    gpuHistory = Array(HISTORY_LEN).fill(0);
+    netRxHistory = Array(HISTORY_LEN).fill(0);
+    netTxHistory = Array(HISTORY_LEN).fill(0);
+    chartAgg = [];
+    chartLive = [];
+    loadServerHistory(name);
+  }
+
+  function currentNodeSnapshot() {
+    return activeNode === 'local' ? localMetrics : (peerMetrics[activeNode] ?? null);
+  }
+
+  function pushLiveFromSnapshot(snap) {
+    if (!snap) return;
+    cpuHistory = pushHistory(cpuHistory, snap.cpu?.usage || 0);
+    gpuHistory = pushHistory(gpuHistory, snap.gpu?.[0]?.utilizationGpu || 0);
+    const net = snap.network?.find(n => n.iface === 'all') || snap.network?.[0];
+    netRxHistory = pushHistory(netRxHistory, net?.rx_sec_mb || 0);
+    netTxHistory = pushHistory(netTxHistory, net?.tx_sec_mb || 0);
+    pushLivePoint({
+      t: snap.timestamp,
+      gpuPower: snap.gpu?.[0]?.powerDraw ?? null,
+      gpuTemp: snap.gpu?.[0]?.temperatureGpu ?? null,
+      cpuTemp: snap.cpu?.temperature ?? null,
+      fan: snap.fan?.state === 'on' ? 1 : snap.fan?.state === 'off' ? 0 : null
+    });
   }
 
   // Live 5s samples, deduplicated by timestamp and trimmed to 10 minutes.
@@ -293,22 +333,25 @@
       } else if (message.type === 'disconnected') {
         connected = false;
       } else if (message.type === 'metrics') {
-        metrics = message.data;
-        cpuHistory = pushHistory(cpuHistory, message.data.cpu?.usage || 0);
-        gpuHistory = pushHistory(gpuHistory, message.data.gpu?.[0]?.utilizationGpu || 0);
-        const net = message.data.network?.find(n => n.iface === 'all') || message.data.network?.[0];
-        netRxHistory = pushHistory(netRxHistory, net?.rx_sec_mb || 0);
-        netTxHistory = pushHistory(netTxHistory, net?.tx_sec_mb || 0);
-        pushLivePoint({
-          t: message.data.timestamp,
-          gpuPower: message.data.gpu?.[0]?.powerDraw ?? null,
-          gpuTemp: message.data.gpu?.[0]?.temperatureGpu ?? null,
-          cpuTemp: message.data.cpu?.temperature ?? null,
-          fan: message.data.fan?.state === 'on' ? 1 : message.data.fan?.state === 'off' ? 0 : null
-        });
+        localMetrics = message.data;
+        if (message.data.nodes?.length) {
+          nodes = message.data.nodes;
+          const next = { ...peerMetrics };
+          for (const n of message.data.nodes) {
+            if (n.name !== 'local' && n.online && n.metrics) next[n.name] = n.metrics;
+          }
+          peerMetrics = next;
+        } else {
+          nodes = [{ name: 'local', host: message.data.system?.hostname, online: true, lastSeen: message.data.timestamp, url: null }];
+        }
+        pushLiveFromSnapshot(currentNodeSnapshot());
       }
     });
-    metrics = getCurrentMetrics();
+    const current = getCurrentMetrics();
+    if (current) {
+      localMetrics = current;
+      if (current.nodes?.length) nodes = current.nodes;
+    }
     connected = isWebSocketConnected();
   });
 
@@ -322,11 +365,13 @@
   let noteInput = $state('');
 
   function startEditNote(modelId, currentNote) {
+    if (activeNode !== 'local') return;
     editingNote = modelId;
     noteInput = currentNote || '';
   }
 
   async function saveNote(modelId) {
+    if (activeNode !== 'local') return;
     await fetch('/api/notes', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -465,6 +510,32 @@
   </div>
 
   {#if metrics}
+    {#if nodes.length > 1}
+      <div class="node-strip">
+        {#each nodes as node}
+          {@const m = node.name === 'local' ? metrics : node.metrics}
+          <button
+            type="button"
+            class="node-chip {node.online ? 'online' : 'offline'} {activeNode === node.name ? 'active' : ''}"
+            aria-pressed={activeNode === node.name}
+            title={activeNode === node.name ? '当前显示' : `切换到 ${node.name === 'local' ? '本机' : node.name}`}
+            onclick={() => selectNode(node.name)}
+          >
+            <span class="status-dot"></span>
+            <span class="node-name">{node.name === 'local' ? '本机' : node.name}</span>
+            {#if m}
+              <span class="node-stat">CPU {m.cpu?.usage?.toFixed(0) ?? '—'}%</span>
+              <span class="node-stat">GPU {m.gpu?.[0]?.utilizationGpu?.toFixed(0) ?? 0}%</span>
+              <span class="node-stat">{m.gpu?.[0]?.temperatureGpu != null ? `${m.gpu[0].temperatureGpu}°C` : 'T —'}</span>
+              <span class="node-stat">{m.gpu?.[0]?.powerDraw != null ? `${m.gpu[0].powerDraw.toFixed(0)}W` : 'P —'}</span>
+              {#if m.fan}<span class="node-stat">Fan {m.fan.state ?? '—'}</span>{/if}
+            {:else}
+              <span class="node-stat">…</span>
+            {/if}
+          </button>
+        {/each}
+      </div>
+    {/if}
     <!-- Row 1: Core Metrics -->
     <div class="stats-grid">
       <!-- CPU -->
@@ -541,6 +612,7 @@
               {#if metrics.fan}
                 <div class="fan-row">
                   <span class="fan-label">Fan {metrics.fan.state ?? '…'}{metrics.fan.reason && metrics.fan.reason !== 'hysteresis' ? ` · ${metrics.fan.reason}` : ''}</span>
+                  {#if activeNode === 'local'}
                   <div class="fan-modes">
                     {#each ['auto', 'on', 'off'] as mode}
                       <button
@@ -550,6 +622,7 @@
                       >{mode}</button>
                     {/each}
                   </div>
+                  {/if}
                 </div>
               {/if}
             </div>
@@ -1081,20 +1154,22 @@
               {:else}
                 <span class="engine-pill stopped">Stopped</span>
               {/if}
-              {#if metrics.inference.comfyui?.running || metrics.inference.comfyui?.pending === 'stop'}
-                <button
-                  type="button"
-                  class="engine-btn stop"
-                  disabled={comfyBusy || metrics.inference.comfyui?.pending === 'stop'}
-                  onclick={() => controlComfy('stop')}
-                >Stop</button>
-              {:else}
-                <button
-                  type="button"
-                  class="engine-btn start"
-                  disabled={comfyBusy || metrics.inference.comfyui?.pending === 'start'}
-                  onclick={() => controlComfy('start')}
-                >Start</button>
+              {#if activeNode === 'local'}
+                {#if metrics.inference.comfyui?.running || metrics.inference.comfyui?.pending === 'stop'}
+                  <button
+                    type="button"
+                    class="engine-btn stop"
+                    disabled={comfyBusy || metrics.inference.comfyui?.pending === 'stop'}
+                    onclick={() => controlComfy('stop')}
+                  >Stop</button>
+                {:else}
+                  <button
+                    type="button"
+                    class="engine-btn start"
+                    disabled={comfyBusy || metrics.inference.comfyui?.pending === 'start'}
+                    onclick={() => controlComfy('start')}
+                  >Start</button>
+                {/if}
               {/if}
             </div>
           </div>
@@ -2643,6 +2718,70 @@
   .footer {
     font-size: 0.8rem;
     letter-spacing: 0.01em;
+  }
+
+  /* Multi-node supervision strip */
+  .node-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.7rem;
+    margin-bottom: 1.1rem;
+  }
+
+  .node-chip {
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+    padding: 0.48rem 0.9rem;
+    border-radius: var(--radius-pill);
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    color: var(--text-secondary);
+    font-size: 0.76rem;
+    cursor: pointer;
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    transition: transform var(--transition-fast), background var(--transition-fast), border-color var(--transition-fast);
+  }
+
+  .node-chip:hover {
+    background: var(--bg-card-hover);
+    border-color: var(--border-color-hover);
+    transform: translateY(-1px);
+  }
+
+  .node-chip .status-dot {
+    width: 7px;
+    height: 7px;
+    animation: none;
+  }
+
+  .node-chip.online .status-dot {
+    background: #32d74b;
+  }
+
+  .node-chip.offline {
+    opacity: 0.62;
+  }
+
+  .node-chip.offline .status-dot {
+    background: #ff453a;
+  }
+
+  .node-chip.active {
+    border-color: rgba(10, 132, 255, 0.45);
+    background: rgba(10, 132, 255, 0.1);
+    box-shadow: 0 0 0 1px rgba(10, 132, 255, 0.18), 0 2px 10px rgba(10, 132, 255, 0.15);
+  }
+
+  .node-name {
+    font-weight: 650;
+    color: var(--text-primary);
+  }
+
+  .node-stat {
+    color: var(--text-tertiary);
+    font-variant-numeric: tabular-nums;
   }
 
   /* Loading skeleton */

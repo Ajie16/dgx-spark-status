@@ -17,6 +17,8 @@ Restart=always
 RestartSec=5
 # dev-server.js binds 0.0.0.0:9000 itself. NODE_ENV is intentionally unset so
 # the Vite dev middleware behaves exactly like ./start.sh (the known-good path).
+# Peer DGX Spark nodes for aggregated supervision (name=url, comma separated).
+# Environment=PEER_NODES=spark-2=http://<peer-ip>:9000
 
 [Install]
 WantedBy=multi-user.target

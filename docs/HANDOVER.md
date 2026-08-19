@@ -42,6 +42,16 @@ GPU 卡片显示当前图形时钟（`clocks.current.graphics`，缺失时回退
 
 常态下每天写入量约 250 KB；唯一曾经可能高频写的场景（GPU 节流在温度阈值附近每秒抖动、每次都重写事件文件）已通过 5 秒稳定窗口 + 30 秒落盘防抖消除。
 
+### 多节点监督
+
+每台 DGX Spark 各自部署并运行自己的面板（互不依赖）。选一台做主节点，在其 systemd 单元里配置 `Environment=PEER_NODES=spark-2=http://<peer-ip>:9000`（`name=url` 逗号分隔，或 JSON 数组）。主节点每 5 秒拉一次对端的 `GET /api/snapshot`（2.5 秒超时），把合并后的 `metrics.nodes`（本机 + 对端的在线状态、最后指标）放进自己的 SSE。`/api/snapshot` 会剥掉 `nodes` 字段，避免“对端的对端”嵌套膨胀。前端在有多节点时于页面顶部渲染节点状态条（在线圆点 + CPU/GPU/温度/功耗/风扇摘要），点击节点胶囊直接把面板切换为对端数据。
+
+第二台部署：克隆/同步仓库 → `npm install` → `sudo cp dgx-spark-status.service /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now dgx-spark-status`，并确保 9000 端口在节点间可达（防火墙放行）。
+
+当前集群实际配置（2026-08-19）：主节点配置 `PEER_NODES=spark-2=http://<peer-ip>:9000`；对端通过 drop-in `node2.conf` 配置反向监督 `PEER_NODES=spark-1=http://<primary-ip>:9000`，并设置 `FAN_CONTROL=0`（对端没有米家脚本）。两端都注册了 systemd 单元（开机自启 + `-lgc 0,2200` 锁频）。
+
+第三台设备（如笔记本）通常路由不到集群内网 IP。因此前端不做跳转：**点击节点胶囊直接把整个面板切换为对端数据**（同源，页面不离开主节点），对端历史由主节点经 `GET /api/history?node=<name>` 服务端代理返回；远程视图会隐藏风扇/ComfyUI/笔记等本机专属操作。另外主节点还为每个对端保留反向代理端口（9101、9102…，`startPeerProxy`），供需要直接打开对端面板的场景使用。
+
 ## 2. 图表：真实时间戳 x 轴 + 1h/6h/24h 切换
 
 改动集中在 `src/lib/SystemMetrics.svelte`：
